@@ -1,0 +1,39 @@
+# =============================
+# Core API server dependencies
+# =============================
+fastapi==0.115.5           # Modern FastAPI framework with Pydantic v2 support
+uvicorn[standard]==0.30.6  # Production-ready ASGI server with standard extras
+
+# =============================
+# Data validation & configuration
+# =============================
+pydantic==2.9.2            # Core data validation using Python type annotations
+pydantic-settings==2.6.1   # Settings management for Pydantic v2
+
+# =============================
+# NLP & Embedding model dependencies
+# =============================
+sentence-transformers==2.7.0  # Framework for state-of-the-art sentence embeddings
+transformers==4.44.2          # HuggingFace transformers library for NLP models
+torch==2.4.1                  # PyTorch deep learning framework (CPU version)
+
+# =============================
+# Numerical computing & utilities
+# =============================
+numpy==1.26.4                 # Fundamental package for scientific computing
+scipy==1.14.1                 # Scientific computing library
+tqdm==4.66.5                  # Progress bar utility
+PyYAML==6.0.2                 # YAML parser and emitter
+
+# =============================
+# File upload handling
+# =============================
+python-multipart==0.0.12      # Multipart form parsing for FastAPI uploads
+
+# =============================
+# Optional performance accelerators
+# =============================
+onnxruntime==1.20.0           # ONNX Runtime for accelerated model inference
+faiss-cpu==1.8.0              # Facebook AI Similarity Search for fast vector retrieval (CPU version)
+
+# Note: For GPU acceleration, replace faiss-cpu with faiss-gpu and add CUDA-compatible PyTorch
