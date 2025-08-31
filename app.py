@@ -1,18 +1,15 @@
-# semantic_search_streamlit_app.py
+# app.py
 import os
 import time
 import json
 import threading
 import logging
-import asyncio
-from typing import List, Dict, Optional, Any, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import requests
+from typing import List, Dict, Optional, Any, Set
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from functools import lru_cache
 from dataclasses import dataclass
-import heapq
 import gc
-from contextlib import asynccontextmanager
 
 # Configure basic logging
 logging.basicConfig(
@@ -34,7 +31,7 @@ try:
     _HAS_FAISS = True
     logger.info("FAISS loaded successfully")
 except ImportError:
-    logger.warning("FAISS not available, using numpy-based index")
+    logger.warning("FAISS not available")
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -58,36 +55,29 @@ import numpy as np
 # CONFIG
 # ------------------ 
 class Settings:
-    LOCAL_MODEL_DIR: str = 'models/all-MiniLM-L6-v2'
-    MODELS_ROOT: str = 'models'
+    # Use your existing model directory
+    LOCAL_MODEL_DIR: str = 'model/all-MiniLM-L6-v2'
+    MODELS_ROOT: str = 'model'
     INDEX_DIR: str = 'index'
-    API_KEY: str = ''
     HNSW_M: int = 32
     BATCH_SIZE: int = 256
     ENCODE_CONCURRENCY: int = 16
-    PERSIST_DEBOUNCE_SECONDS: int = 30
-    USE_ONNX: bool = True if _HAS_ONNX else False
-    ONNX_MODEL_DIR: str = 'models/onnx'
-    FAISS_ON_GPU: bool = False
+    USE_ONNX: bool = False  # Disable ONNX for simplicity
     MAX_QUERY_LENGTH: int = 128
     PRELOAD_MODEL: bool = True
     WARMUP_MODEL: bool = True
-    PREALLOCATE_BUFFERS: bool = True
-    USE_BATCHED_ENCODING: bool = True
-    MAX_BATCH_SIZE: int = 64
     SEARCH_CACHE_ENABLED: bool = True
     FAISS_NPROBE: int = 8
     CACHE_TTL_SECONDS: int = 300
-    GC_COLLECTION_INTERVAL: int = 300
-    MEMORY_MONITOR_INTERVAL: int = 60
-    MEMORY_THRESHOLD_MB: int = 1024
-    USE_PROCESS_POOL: bool = False
-    PROCESS_POOL_SIZE: int = 4
+    # Ping settings
+    PING_INTERVAL: int = 10  # Ping every 10 seconds
+    PING_URL: str = os.environ.get("PING_URL", "")  # URL to ping
 
 settings = Settings()
 
 # File paths
 INDEX_DIR = settings.INDEX_DIR
+os.makedirs(INDEX_DIR, exist_ok=True)
 MAPPING_PATH = os.path.join(INDEX_DIR, 'mapping.json')
 FAISS_INDEX_PATH = os.path.join(INDEX_DIR, 'products.index')
 IDS_PATH = os.path.join(INDEX_DIR, 'ids.json')
@@ -98,7 +88,7 @@ MANIFEST_PATH = os.path.join(INDEX_DIR, 'manifest.json')
 class ProductItem:
     def __init__(self, product_id: str, text: str):
         self.product_id = product_id
-        self.text = text
+        self.text = str(text)
 
 class SearchResult:
     def __init__(self, product_id: str, similarity_score: float):
@@ -163,14 +153,12 @@ class QueryCache:
         for key in expired_keys:
             del self.cache[key]
         self.last_cleanup = now
-        logger.info(f"Cache cleanup removed {len(expired_keys)} expired entries")
 
 # ------------------ 
-# Globals (guarded)
+# Globals
 # ------------------ 
 _model_lock = threading.RLock()
 _model: Optional[SentenceTransformer] = None
-_onnx_session: Optional[Any] = None
 _model_meta: Optional[Dict[str, Any]] = None
 _dim: Optional[int] = None
 _index_lock = threading.RLock()
@@ -185,19 +173,16 @@ _executor = ThreadPoolExecutor(
     max_workers=max(1, settings.ENCODE_CONCURRENCY),
     thread_name_prefix="encode_worker"
 )
-_process_executor = ProcessPoolExecutor(
-    max_workers=settings.PROCESS_POOL_SIZE
-) if settings.USE_PROCESS_POOL else None
 _persist_lock = threading.Lock()
 _persist_scheduled = False
-_persist_dirty = False
 
 # Optimization globals
 _query_cache = QueryCache(max_size=10000, ttl_seconds=settings.CACHE_TTL_SECONDS)
-_vector_cache: Dict[str, np.ndarray] = {}
-_vector_cache_lock = threading.RLock()
 _last_gc_run = time.time()
-_last_memory_check = time.time()
+
+# Ping thread to keep app awake
+_ping_thread = None
+_ping_running = False
 
 # ------------------ 
 # Persistence helpers
@@ -218,7 +203,6 @@ def load_json(path: str, default: Any):
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
-        logger.exception('Failed to load JSON from %s', path)
         return default
 
 def save_manifest_atomic(manifest: dict) -> None:
@@ -229,28 +213,9 @@ def save_ids_atomic(ids_list: List[int]):
     atomic_write_json(IDS_PATH, ids_list)
 
 # ------------------ 
-# Index abstractions (Faiss & Numpy)
+# Index abstractions (Faiss)
 # ------------------ 
-class BaseIndex:
-    def add_with_ids(self, vectors: np.ndarray, ids: np.ndarray):
-        raise NotImplementedError
-    
-    def remove_ids(self, ids: np.ndarray):
-        raise NotImplementedError
-    
-    def search(self, qvec: np.ndarray, topk: int):
-        raise NotImplementedError
-    
-    def ntotal(self) -> int:
-        raise NotImplementedError
-    
-    def persist(self):
-        raise NotImplementedError
-    
-    def load(self):
-        raise NotImplementedError
-
-class FaissIndex(BaseIndex):
+class FaissIndex:
     def __init__(self, dim: int, path: str, hnsw_m: int = 32):
         self.dim = dim
         self.path = path
@@ -267,39 +232,30 @@ class FaissIndex(BaseIndex):
                 logger.info('Loaded FAISS index from %s', self.path)
                 return
             except Exception:
-                logger.warning('Failed to load FAISS index; will recreate', exc_info=True)
+                logger.warning('Failed to load FAISS index; will recreate')
         
         if not _HAS_FAISS:
             raise RuntimeError('FAISS not available in this environment')
         
-        if settings.FAISS_ON_GPU and faiss.get_num_gpus() > 0:
-            try:
-                res = faiss.StandardGpuResources()
-                base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
-                self.index = faiss.index_cpu_to_gpu(res, 0, base)
-                logger.info('Created new FAISS GPU index (dim=%d)', self.dim)
-            except Exception:
-                logger.warning('Failed to create GPU index, falling back to CPU', exc_info=True)
-                base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
-                self.index = faiss.IndexIDMap(base)
-        else:
-            base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
-            self.index = faiss.IndexIDMap(base)
-            logger.info('Created new FAISS CPU index (dim=%d)', self.dim)
+        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
+        self.index = faiss.IndexIDMap(base)
+        logger.info('Created new FAISS CPU index (dim=%d)', self.dim)
     
     def add_with_ids(self, vectors: np.ndarray, ids: np.ndarray):
         if vectors.dtype != np.float32:
             vectors = vectors.astype('float32')
-        vectors = l2_normalize_np(vectors).astype('float32')
+        vectors = self.l2_normalize_np(vectors).astype('float32')
         self.index.add_with_ids(vectors, ids.astype(np.int64))
         
         try:
             existing = load_json(IDS_PATH, [])
             existing.extend([int(x) for x in ids.tolist()])
-            seen = set(); dedup = []
+            seen = set()
+            dedup = []
             for v in existing:
                 if v not in seen:
-                    dedup.append(v); seen.add(v)
+                    dedup.append(v)
+                    seen.add(v)
             save_ids_atomic(dedup)
         except Exception:
             logger.exception('Failed to update ids on disk for faiss')
@@ -322,7 +278,7 @@ class FaissIndex(BaseIndex):
     def search(self, qvec: np.ndarray, topk: int):
         if qvec.dtype != np.float32:
             qvec = qvec.astype('float32')
-        qvec = l2_normalize_np(qvec).astype('float32')
+        qvec = self.l2_normalize_np(qvec).astype('float32')
         D, I = self.index.search(qvec, topk)
         return D, I
     
@@ -334,12 +290,21 @@ class FaissIndex(BaseIndex):
             return int(self.index.ntotal)
     
     def persist(self):
-        tmp = self.path + '.tmp'
-        faiss.write_index(self.index, tmp)
-        os.replace(tmp, self.path)
+        if _HAS_FAISS:
+            tmp = self.path + '.tmp'
+            faiss.write_index(self.index, tmp)
+            os.replace(tmp, self.path)
     
     def load(self):
         self._init_or_load()
+    
+    def l2_normalize_np(self, x: np.ndarray) -> np.ndarray:
+        if x.ndim == 1:
+            norm = np.linalg.norm(x)
+            return x / (norm + 1e-12)
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1e-12, norms)
+        return x / norms
 
 # ------------------ 
 # Helpers: mapping/tombstones
@@ -375,45 +340,54 @@ def save_manifest():
             logger.exception('Failed to write manifest')
 
 # ------------------ 
-# Consistency routines
+# Model loading
 # ------------------ 
-def _ensure_mapping_vector_consistency():
-    global _mapping, _rev_map, _next_id_counter
-    with _index_lock:
+def _load_model_from(path: str):
+    global _model, _model_meta, _dim
+    if SentenceTransformer is None:
+        raise RuntimeError('sentence-transformers library not available in environment')
+    
+    logger.info('Loading model from %s', path)
+    
+    model = SentenceTransformer(path)
+    dim = model.get_sentence_embedding_dimension()
+    
+    with _model_lock:
+        _model = model
+        _dim = dim
+        _model_meta = {'name': os.path.basename(path.rstrip('/')), 'dim': dim}
+    
+    if settings.WARMUP_MODEL:
         try:
-            vec_ids = set()
-            disk_ids = set(load_json(IDS_PATH, []))
-            if disk_ids:
-                vec_ids = set(int(x) for x in disk_ids)
-            else:
-                if _HAS_FAISS and _index_impl and hasattr(_index_impl.index, 'ntotal'):
-                    vec_ids = set(range(_index_impl.index.ntotal))
-                else:
-                    vec_ids = set(_mapping.keys()) if _mapping else set()
-            
-            mapping_ids = set(_mapping.keys())
-            if vec_ids == mapping_ids:
-                _rev_map = {v: k for k, v in _mapping.items()}
-                _next_id_counter = max(mapping_ids) + 1 if mapping_ids else 0
-                return
-            
-            if not vec_ids and mapping_ids:
-                backup = MAPPING_PATH + '.backup.' + str(int(time.time()))
-                atomic_write_json(backup, {str(k): v for k, v in _mapping.items()})
-                _mapping = {}; _rev_map = {}; _next_id_counter = 0
-                save_mapping(_mapping)
-                logger.warning('Vectors missing but mapping existed: mapping backed up and cleared')
-                return
-            
-            common = {k: v for k, v in _mapping.items() if int(k) in vec_ids}
-            if len(common) != len(_mapping):
-                logger.warning('Mapping and vector id sets disagreed; truncating mapping to common ids')
-                _mapping = {int(k): v for k, v in common.items()}
-                _rev_map = {v: k for k, v in _mapping.items()}
-                _next_id_counter = max(vec_ids) + 1 if vec_ids else 0
-                save_mapping(_mapping)
+            logger.info('Warming up model...')
+            warmup_texts = ['hello world'] * 4  # Smaller batch for Streamlit
+            _ = model.encode(warmup_texts, convert_to_numpy=True, batch_size=4, show_progress_bar=False)
+            logger.info('Warmup complete')
         except Exception:
-            logger.exception('Error ensuring mapping/vector consistency')
+            logger.exception('Warmup failed (non-fatal)')
+    
+    return _model
+
+def get_model_safe() -> Optional[SentenceTransformer]:
+    global _model, _dim, _model_meta
+    with _model_lock:
+        if _model is not None:
+            return _model
+        
+        # Use the model path from your repository
+        model_dir = settings.LOCAL_MODEL_DIR
+        if not os.path.exists(model_dir):
+            logger.warning('Model not found at: %s', model_dir)
+            return None
+        
+        try:
+            return _load_model_from(model_dir)
+        except Exception:
+            logger.exception('Failed to load model from: %s', model_dir)
+            _model = None
+            _dim = None
+            _model_meta = None
+            return None
 
 # ------------------ 
 # Index chooser
@@ -424,217 +398,48 @@ def ensure_index_impl(dim: int):
         if _HAS_FAISS:
             _index_impl = FaissIndex(dim=dim, path=FAISS_INDEX_PATH, hnsw_m=settings.HNSW_M)
         else:
-            raise RuntimeError("FAISS is required for production use")
+            raise RuntimeError("FAISS is required")
         _index_impl.load()
 
 # ------------------ 
-# Model loading helpers
-# ------------------ 
-def find_local_model_dir() -> Optional[str]:
-    if settings.LOCAL_MODEL_DIR and os.path.exists(settings.LOCAL_MODEL_DIR):
-        return settings.LOCAL_MODEL_DIR
-    
-    root = Path(settings.MODELS_ROOT)
-    if not root.exists() or not root.is_dir():
-        return None
-    
-    candidates = []
-    for p in root.iterdir():
-        if p.is_dir():
-            if (p / 'config_sentence_transformers.json').exists() or (p / 'tokenizer.json').exists() or (p / 'config.json').exists():
-                candidates.append(str(p))
-    
-    if not candidates:
-        return None
-    candidates.sort(key=lambda s: os.path.getmtime(s), reverse=True)
-    return candidates[0]
-
-def _load_model_from(path: str):
-    global _model, _model_meta, _dim, _onnx_session
-    if SentenceTransformer is None:
-        raise RuntimeError('sentence-transformers library not available in environment')
-    
-    logger.info('Loading model from %s', path)
-    
-    if settings.USE_ONNX and _HAS_ONNX:
-        onnx_path = os.path.join(settings.ONNX_MODEL_DIR, "model.onnx")
-        if os.path.exists(onnx_path):
-            try:
-                options = ort.SessionOptions()
-                options.intra_op_num_threads = 1
-                options.inter_op_num_threads = 1
-                options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if ort.get_device() == 'GPU' else ['CPUExecutionProvider']
-                
-                _onnx_session = ort.InferenceSession(onnx_path, options, providers=providers)
-                model_output = _onnx_session.get_outputs()[0]
-                _dim = model_output.shape[-1]
-                _model_meta = {'name': os.path.basename(path.rstrip('/')), 'dim': _dim, 'onnx': True}
-                logger.info('Loaded ONNX model from %s, dim=%d', onnx_path, _dim)
-                return None
-            except Exception as e:
-                logger.warning('Failed to load ONNX model: %s', e)
-    
-    model = SentenceTransformer(path)
-    dim = model.get_sentence_embedding_dimension()
-    
-    with _model_lock:
-        _model = model
-        _dim = dim
-        _model_meta = {'name': os.path.basename(path.rstrip('/')), 'dim': dim, 'onnx': False}
-    
-    if settings.WARMUP_MODEL:
-        try:
-            logger.info('Warming up model...')
-            warmup_texts = ['hello world'] * 16
-            _ = model.encode(warmup_texts, convert_to_numpy=True, batch_size=16, show_progress_bar=False)
-            logger.info('Warmup complete')
-        except Exception:
-            logger.exception('Warmup failed (non-fatal)')
-    
-    return _model
-
-def get_model_safe() -> Optional[SentenceTransformer]:
-    global _model, _dim, _model_meta, _onnx_session
-    with _model_lock:
-        if _model is not None or _onnx_session is not None:
-            return _model
-        
-        model_dir = find_local_model_dir()
-        if not model_dir:
-            logger.warning('No local model found (searched %s and LOCAL_MODEL_DIR)', settings.MODELS_ROOT)
-            return None
-        
-        try:
-            return _load_model_from(model_dir)
-        except Exception:
-            logger.exception('Failed to load model from: %s', model_dir)
-            _model = None
-            _dim = None
-            _model_meta = None
-            _onnx_session = None
-            return None
-
-# ------------------ 
-# Helpers
-# ------------------ 
-def l2_normalize_np(x: np.ndarray) -> np.ndarray:
-    if x.ndim == 1:
-        norm = np.linalg.norm(x)
-        return x / (norm + 1e-12)
-    norms = np.linalg.norm(x, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1e-12, norms)
-    return x / norms
-
-def encode_with_onnx(texts: List[str]) -> np.ndarray:
-    if _onnx_session is None:
-        raise RuntimeError("ONNX session not initialized")
-    
-    if _model is not None:
-        features = _model.tokenize(texts)
-        inputs = {
-            'input_ids': features['input_ids'].numpy(),
-            'attention_mask': features['attention_mask'].numpy(),
-            'token_type_ids': features['token_type_ids'].numpy() if 'token_type_ids' in features else None
-        }
-        inputs = {k: v for k, v in inputs.items() if v is not None}
-    else:
-        max_length = min(max(len(text) for text in texts), settings.MAX_QUERY_LENGTH)
-        input_ids = np.zeros((len(texts), max_length), dtype=np.int64)
-        attention_mask = np.ones((len(texts), max_length), dtype=np.int64)
-        inputs = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask
-        }
-    
-    outputs = _onnx_session.run(None, inputs)
-    embeddings = outputs[0]
-    
-    if len(embeddings.shape) == 3:
-        embeddings = np.mean(embeddings, axis=1)
-    
-    return l2_normalize_np(embeddings)
-
-def _schedule_persist():
-    global _persist_scheduled, _persist_dirty
-    with _persist_lock:
-        _persist_dirty = True
-        if _persist_scheduled:
-            return
-        _persist_scheduled = True
-    
-    def worker():
-        global _persist_scheduled, _persist_dirty
-        time.sleep(settings.PERSIST_DEBOUNCE_SECONDS)
-        try:
-            with _index_lock:
-                logger.info('Persisting mapping, tombstones and index...')
-                save_mapping(_mapping)
-                save_tombstones()
-                try:
-                    _index_impl.persist()
-                except Exception:
-                    logger.exception('Index persist failed')
-                try:
-                    save_manifest()
-                except Exception:
-                    logger.exception('Failed to persist manifest')
-        finally:
-            with _persist_lock:
-                _persist_dirty = False
-                _persist_scheduled = False
-    
-    t = threading.Thread(target=worker, daemon=True)
-    add_script_run_ctx(t)  # Make thread compatible with Streamlit
-    t.start()
-
-# ------------------ 
-# Core API functions for Streamlit
+# Core API functions
 # ------------------ 
 def health():
     return {
         'status': 'ok',
-        'model_loaded': get_model_safe() is not None or _onnx_session is not None,
+        'model_loaded': _model is not None,
         'model_version': _model_meta.get('name') if _model_meta else None,
         'index_size': _index_impl.ntotal() if _index_impl else 0,
         'timestamp': int(time.time()),
         'mapping_count': len(_mapping),
         'tombstones': len(_tombstones),
-        'cache_stats': {'hits': _query_cache.hits, 'misses': _query_cache.misses, 'size': len(_query_cache.cache)}
     }
 
 def search(q: str, topk: int = 10):
-    """Search function for Streamlit"""
     if not q:
-        return {"error": "Missing 'q' parameter"}
+        return {"error": "Missing query parameter"}
     
     cached = _query_cache.get(q, topk)
     if cached is not None:
         return cached
     
     model = get_model_safe()
-    if model is None and _onnx_session is None:
-        return {"error": 'Model not loaded; ensure models/ contains a valid model'}
+    if model is None:
+        return {"error": 'Model not loaded'}
     
     start = time.time()
     
     try:
         with _encode_semaphore:
             truncated_q = q[:settings.MAX_QUERY_LENGTH] if len(q) > settings.MAX_QUERY_LENGTH else q
-            
-            if _onnx_session is not None:
-                qvec = encode_with_onnx([truncated_q])
-            else:
-                qvec = model.encode(
-                    [truncated_q], 
-                    convert_to_numpy=True, 
-                    batch_size=1,
-                    show_progress_bar=False
-                )
-                qvec = np.array(qvec)
-            
-            qvec = l2_normalize_np(qvec).astype('float32')
+            qvec = model.encode(
+                [truncated_q], 
+                convert_to_numpy=True, 
+                batch_size=1,
+                show_progress_bar=False
+            )
+            qvec = np.array(qvec)
+            qvec = _index_impl.l2_normalize_np(qvec).astype('float32')
             enc_ms = (time.time() - start) * 1000.0
     except Exception:
         logger.exception('Encode error')
@@ -667,7 +472,7 @@ def search(q: str, topk: int = 10):
     _query_cache.put(q, topk, results)
     
     query_ms = (time.time() - start) * 1000.0
-    logger.info(f"Query took {query_ms:.2f}ms (encode: {enc_ms:.2f}ms)")
+    logger.info(f"Query took {query_ms:.2f}ms")
     
     _metrics['queries'] += 1
     _metrics['avg_query_ms'] = (_metrics['avg_query_ms'] * (_metrics['queries'] - 1) + query_ms) / _metrics['queries']
@@ -675,10 +480,9 @@ def search(q: str, topk: int = 10):
     return results
 
 def embeddings_endpoint(payload):
-    """Embeddings function for Streamlit"""
     model = get_model_safe()
-    if model is None and _onnx_session is None:
-        return {"error": 'Model not loaded; ensure models/ contains a valid model'}
+    if model is None:
+        return {"error": 'Model not loaded'}
     
     texts: List[str] = []
     
@@ -717,16 +521,13 @@ def embeddings_endpoint(payload):
         for i in range(0, len(texts), settings.MAX_BATCH_SIZE):
             batch = texts[i:i + settings.MAX_BATCH_SIZE]
             with _encode_semaphore:
-                if _onnx_session is not None:
-                    vecs = encode_with_onnx(batch)
-                else:
-                    vecs = model.encode(
-                        batch, 
-                        batch_size=len(batch), 
-                        convert_to_tensor=False,
-                        show_progress_bar=False,
-                        normalize_embeddings=True
-                    )
+                vecs = model.encode(
+                    batch, 
+                    batch_size=len(batch), 
+                    convert_to_tensor=False,
+                    show_progress_bar=False,
+                    normalize_embeddings=True
+                )
                 embeddings.extend(vecs.tolist())
         
         encode_time = (time.time() - start_time) * 1000
@@ -745,163 +546,40 @@ def embeddings_endpoint(payload):
         "count": len(embeddings)
     }
 
-def reindex(items: List[ProductItem]):
-    model = get_model_safe()
-    if model is None and _onnx_session is None:
-        return {"error": 'Model not loaded'}
-    if not items:
-        return {"error": 'Request body must be non-empty'}
+# ------------------ 
+# Ping functionality to keep app awake
+# ------------------ 
+def start_ping_thread():
+    """Start a thread that pings the app regularly to keep it awake"""
+    global _ping_thread, _ping_running
     
-    texts = [it.text for it in items]; pids = [it.product_id for it in items]
+    if not settings.PING_URL:
+        logger.info("No PING_URL configured, skipping ping thread")
+        return
     
-    try:
-        with _encode_semaphore:
-            if _onnx_session is not None:
-                vecs = encode_with_onnx(texts)
-            else:
-                vecs = model.encode(texts, convert_to_numpy=True, batch_size=settings.BATCH_SIZE, show_progress_bar=False)
-            vecs = l2_normalize_np(vecs).astype('float32')
-    except Exception:
-        logger.exception('Failed to encode items')
-        return {"error": 'Failed to encode items'}
+    _ping_running = True
     
-    assigned = {}
-    with _index_lock:
-        for vec, pid in zip(vecs, pids):
-            existing = _rev_map.get(pid)
-            if existing is not None:
-                try:
-                    _index_impl.remove_ids(np.array([existing], dtype=np.int64))
-                except Exception:
-                    logger.debug('Backend does not support remove_ids; replacement may leave duplicates')
-                _index_impl.add_with_ids(vec.reshape(1, -1), np.array([existing], dtype=np.int64))
-                assigned[pid] = existing
-            else:
-                nid = int(_next_id_counter); _next_id_counter += 1
-                _index_impl.add_with_ids(vec.reshape(1, -1), np.array([nid], dtype=np.int64))
-                _mapping[nid] = pid; _rev_map[pid] = nid
-                assigned[pid] = nid
-    
-    _schedule_persist()
-    return {'indexed': len(assigned), 'assigned_index_ids': assigned}
-
-def delete_items(product_ids: List[str]):
-    if not product_ids:
-        return {"error": 'Provide non-empty product_ids list'}
-    
-    to_remove_ids = []
-    with _index_lock:
-        for pid in product_ids:
-            nid = _rev_map.get(pid)
-            if nid is None:
-                continue
-            to_remove_ids.append(nid)
-            _tombstones.add(pid)
-            if nid in _mapping:
-                del _mapping[nid]
-            if pid in _rev_map:
-                del _rev_map[pid]
-    
-    if not to_remove_ids:
-        return {'deleted': 0}
-    
-    try:
-        _index_impl.remove_ids(np.array(to_remove_ids, dtype=np.int64))
-    except Exception:
-        logger.debug('backend did not support remove_ids; tombstones added')
-    
-    _schedule_persist()
-    return {'deleted': len(to_remove_ids)}
-
-def reload_model():
-    global _model, _model_meta, _dim, _onnx_session
-    model_dir = find_local_model_dir()
-    if not model_dir:
-        return {"error": f'LOCAL_MODEL_DIR not found and no model in {settings.MODELS_ROOT}'}
-    if SentenceTransformer is None and not _HAS_ONNX:
-        return {"error": 'SentenceTransformer and ONNX not available in environment'}
-    
-    try:
-        if settings.USE_ONNX and _HAS_ONNX:
-            onnx_path = os.path.join(settings.ONNX_MODEL_DIR, "model.onnx")
-            if os.path.exists(onnx_path):
-                try:
-                    options = ort.SessionOptions()
-                    options.intra_op_num_threads = 1
-                    options.inter_op_num_threads = 1
-                    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                    
-                    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if ort.get_device() == 'GPU' else ['CPUExecutionProvider']
-                    
-                    new_onnx_session = ort.InferenceSession(onnx_path, options, providers=providers)
-                    model_output = new_onnx_session.get_outputs()[0]
-                    new_dim = model_output.shape[-1]
-                    
-                    if _index_impl and _index_impl.ntotal() > 0 and new_dim != _dim:
-                        return {"error": f'model dimension mismatch (current index dim={_dim}, candidate dim={new_dim}). Rebuild required before switching.'}
-                    
-                    with _model_lock:
-                        old_onnx = _onnx_session
-                        _onnx_session = new_onnx_session
-                        _dim = new_dim
-                        _model_meta = {'name': os.path.basename(model_dir), 'dim': _dim, 'onnx': True}
-                        ensure_index_impl(_dim)
-                        save_manifest()
-                        try:
-                            del old_onnx
-                        except Exception:
-                            pass
-                    
-                    return {'status': 'model_reloaded', 'model_meta': _model_meta}
-                except Exception as e:
-                    logger.warning('Failed to load ONNX model: %s', e)
-        
-        candidate = SentenceTransformer(model_dir)
-        cand_dim = candidate.get_sentence_embedding_dimension()
-        if _index_impl and _index_impl.ntotal() > 0 and cand_dim != _dim:
-            return {"error": f'model dimension mismatch (current index dim={_dim}, candidate dim={cand_dim}). Rebuild required before switching.'}
-        
-        with _model_lock:
-            old = _model
-            _model = candidate
-            _dim = cand_dim
-            _model_meta = {'name': os.path.basename(model_dir), 'dim': _dim, 'onnx': False}
-            ensure_index_impl(_dim)
-            save_manifest()
+    def ping_worker():
+        while _ping_running:
             try:
-                del old
-            except Exception:
-                pass
-        
-        return {'status': 'model_reloaded', 'model_meta': _model_meta}
-    except Exception:
-        logger.exception('Failed to reload model')
-        return {"error": 'failed to load model'}
+                response = requests.get(settings.PING_URL)
+                logger.info(f"Ping sent, status: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Ping failed: {e}")
+            time.sleep(settings.PING_INTERVAL)
+    
+    _ping_thread = threading.Thread(target=ping_worker, daemon=True)
+    add_script_run_ctx(_ping_thread)  # Make thread compatible with Streamlit
+    _ping_thread.start()
+    logger.info("Ping thread started")
 
-def get_metrics():
-    return {
-        'queries': _metrics['queries'],
-        'encodes': _metrics['encodes'],
-        'avg_encode_ms': _metrics['avg_encode_ms'],
-        'avg_query_ms': _metrics['avg_query_ms'],
-        'cache_stats': {
-            'hits': _query_cache.hits,
-            'misses': _query_cache.misses,
-            'size': len(_query_cache.cache)
-        }
-    }
-
-def clear_caches():
-    global _query_cache, _vector_cache
-    
-    with _query_cache.lock:
-        _query_cache.cache.clear()
-    
-    with _vector_cache_lock:
-        _vector_cache.clear()
-    
-    logger.info("Caches cleared to free memory")
-    return {'status': 'cache_cleared'}
+def stop_ping_thread():
+    """Stop the ping thread"""
+    global _ping_running
+    _ping_running = False
+    if _ping_thread:
+        _ping_thread.join(timeout=5.0)
+    logger.info("Ping thread stopped")
 
 # ------------------ 
 # Streamlit UI
@@ -918,10 +596,11 @@ def main():
     # Initialize the system
     if 'initialized' not in st.session_state:
         startup_event()
+        start_ping_thread()  # Start ping thread
         st.session_state.initialized = True
     
     # Create tabs for different functionalities
-    tab1, tab2, tab3, tab4 = st.tabs(["Search", "Embeddings", "Admin", "Health"])
+    tab1, tab2, tab3 = st.tabs(["Search", "Embeddings", "Health"])
     
     with tab1:
         st.header("Semantic Search")
@@ -945,21 +624,14 @@ def main():
         st.header("Embeddings Generation")
         
         with st.form("embeddings_form"):
-            input_type = st.radio("Input type", ["Text", "List of texts", "JSON"])
+            input_type = st.radio("Input type", ["Text", "List of texts"])
             
             if input_type == "Text":
                 text_input = st.text_area("Enter text")
                 payload = text_input
-            elif input_type == "List of texts":
+            else:
                 texts_input = st.text_area("Enter texts (one per line)")
                 payload = texts_input.split("\n") if texts_input else []
-            else:
-                json_input = st.text_area("Enter JSON payload")
-                try:
-                    payload = json.loads(json_input) if json_input else {}
-                except json.JSONDecodeError:
-                    st.error("Invalid JSON")
-                    payload = {}
             
             submitted = st.form_submit_button("Generate Embeddings")
             
@@ -973,57 +645,6 @@ def main():
                         st.json(result)
     
     with tab3:
-        st.header("Administration")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Model Management")
-            if st.button("Reload Model"):
-                result = reload_model()
-                if "error" in result:
-                    st.error(result["error"])
-                else:
-                    st.success("Model reloaded successfully")
-                    st.json(result)
-            
-            if st.button("Clear Cache"):
-                result = clear_caches()
-                st.success("Cache cleared successfully")
-        
-        with col2:
-            st.subheader("Index Management")
-            
-            uploaded_file = st.file_uploader("Upload CSV for indexing", type=["csv"])
-            if uploaded_file is not None:
-                import csv
-                import io
-                content = uploaded_file.read().decode('utf-8')
-                reader = csv.DictReader(io.StringIO(content))
-                items = []
-                for r in reader:
-                    if 'product_id' not in r or 'text' not in r:
-                        continue
-                    items.append(ProductItem(product_id=r['product_id'], text=r['text']))
-                
-                if items and st.button("Index CSV Data"):
-                    with st.spinner("Indexing..."):
-                        result = reindex(items)
-                        if "error" in result:
-                            st.error(result["error"])
-                        else:
-                            st.success(f"Indexed {result['indexed']} items")
-            
-            delete_ids = st.text_area("Product IDs to delete (one per line)")
-            if delete_ids and st.button("Delete Items"):
-                ids_to_delete = delete_ids.split("\n")
-                result = delete_items(ids_to_delete)
-                if "error" in result:
-                    st.error(result["error"])
-                else:
-                    st.success(f"Deleted {result['deleted']} items")
-    
-    with tab4:
         st.header("System Health")
         
         if st.button("Refresh Health Status"):
@@ -1033,23 +654,17 @@ def main():
         st.json(health_status)
         
         st.subheader("Metrics")
-        metrics = get_metrics()
-        st.json(metrics)
+        st.metric("Total Queries", _metrics['queries'])
+        st.metric("Total Encodes", _metrics['encodes'])
+        st.metric("Avg Query Time", f"{_metrics['avg_query_ms']:.2f} ms")
+        st.metric("Avg Encode Time", f"{_metrics['avg_encode_ms']:.2f} ms")
         
-        st.subheader("Performance Charts")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Total Queries", metrics['queries'])
-            st.metric("Average Query Time", f"{metrics['avg_query_ms']:.2f} ms")
-        
-        with col2:
-            st.metric("Total Encodes", metrics['encodes'])
-            st.metric("Average Encode Time", f"{metrics['avg_encode_ms']:.2f} ms")
-        
-        cache_stats = metrics['cache_stats']
-        hit_ratio = cache_stats['hits'] / (cache_stats['hits'] + cache_stats['misses']) if (cache_stats['hits'] + cache_stats['misses']) > 0 else 0
-        st.metric("Cache Hit Ratio", f"{hit_ratio:.2%}")
+        # Display ping status
+        st.subheader("Ping Status")
+        if settings.PING_URL:
+            st.info(f"Pinging {settings.PING_URL} every {settings.PING_INTERVAL} seconds")
+        else:
+            st.warning("PING_URL not configured - app may sleep when inactive")
 
 # ------------------ 
 # Startup and initialization
@@ -1063,26 +678,24 @@ def startup_event():
     manifest = load_manifest() or {}
     _next_id_counter = int(manifest.get('next_id_counter', max(_mapping.keys()) + 1 if _mapping else 0))
     
+    # Load model - this will use your existing model directory
     get_model_safe()
     
+    # Ensure index exists
     if _dim is None:
-        _dim = 384
+        _dim = 384  # Default dimension for all-MiniLM-L6-v2
     ensure_index_impl(_dim)
-    
-    try:
-        _ensure_mapping_vector_consistency()
-    except Exception:
-        logger.exception('Consistency check failed at startup')
     
     try:
         save_manifest()
     except Exception:
         logger.exception('Failed to save manifest on startup')
     
-    logger.info('Startup complete. model_loaded=%s index_size=%d', _model is not None or _onnx_session is not None, _index_impl.ntotal())
+    logger.info('Startup complete. model_loaded=%s index_size=%d', _model is not None, _index_impl.ntotal() if _index_impl else 0)
 
 # ------------------ 
 # Main entry point
 # ------------------ 
 if __name__ == "__main__":
     main()
+
