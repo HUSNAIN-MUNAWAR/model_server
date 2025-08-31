@@ -55,7 +55,7 @@ import numpy as np
 # CONFIG
 # ------------------ 
 class Settings:
-    # Use your existing model directory
+    # Use your existing model directory - fixed path
     LOCAL_MODEL_DIR: str = 'model/all-MiniLM-L6-v2'
     MODELS_ROOT: str = 'model'
     INDEX_DIR: str = 'index'
@@ -349,6 +349,11 @@ def _load_model_from(path: str):
     
     logger.info('Loading model from %s', path)
     
+    # Check if model directory exists
+    if not os.path.exists(path):
+        logger.error('Model directory does not exist: %s', path)
+        return None
+    
     model = SentenceTransformer(path)
     dim = model.get_sentence_embedding_dimension()
     
@@ -377,8 +382,19 @@ def get_model_safe() -> Optional[SentenceTransformer]:
         # Use the model path from your repository
         model_dir = settings.LOCAL_MODEL_DIR
         if not os.path.exists(model_dir):
-            logger.warning('Model not found at: %s', model_dir)
-            return None
+            logger.error('Model not found at: %s', model_dir)
+            # Try to find any model in the models directory
+            model_root = Path(settings.MODELS_ROOT)
+            if model_root.exists() and model_root.is_dir():
+                for p in model_root.iterdir():
+                    if p.is_dir():
+                        model_dir = str(p)
+                        logger.info('Found alternative model at: %s', model_dir)
+                        break
+            
+            if not os.path.exists(model_dir):
+                logger.error('No models found in %s', settings.MODELS_ROOT)
+                return None
         
         try:
             return _load_model_from(model_dir)
@@ -427,6 +443,12 @@ def search(q: str, topk: int = 10):
     if model is None:
         return {"error": 'Model not loaded'}
     
+    # Ensure index is initialized
+    if _index_impl is None:
+        if _dim is None:
+            return {"error": 'Model dimension not set'}
+        ensure_index_impl(_dim)
+    
     start = time.time()
     
     try:
@@ -441,9 +463,9 @@ def search(q: str, topk: int = 10):
             qvec = np.array(qvec)
             qvec = _index_impl.l2_normalize_np(qvec).astype('float32')
             enc_ms = (time.time() - start) * 1000.0
-    except Exception:
-        logger.exception('Encode error')
-        return {"error": 'Failed to encode query'}
+    except Exception as e:
+        logger.exception('Encode error: %s', e)
+        return {"error": f'Failed to encode query: {e}'}
     
     with _index_lock:
         if hasattr(_index_impl.index, 'nprobe'):
@@ -562,7 +584,7 @@ def start_ping_thread():
     def ping_worker():
         while _ping_running:
             try:
-                response = requests.get(settings.PING_URL)
+                response = requests.get(settings.PING_URL, timeout=10)
                 logger.info(f"Ping sent, status: {response.status_code}")
             except Exception as e:
                 logger.error(f"Ping failed: {e}")
@@ -679,23 +701,29 @@ def startup_event():
     _next_id_counter = int(manifest.get('next_id_counter', max(_mapping.keys()) + 1 if _mapping else 0))
     
     # Load model - this will use your existing model directory
-    get_model_safe()
+    model = get_model_safe()
     
     # Ensure index exists
     if _dim is None:
         _dim = 384  # Default dimension for all-MiniLM-L6-v2
-    ensure_index_impl(_dim)
+    
+    # Initialize index only if model is loaded
+    if model is not None:
+        ensure_index_impl(_dim)
+    else:
+        logger.warning("Model not loaded, index initialization skipped")
     
     try:
         save_manifest()
     except Exception:
         logger.exception('Failed to save manifest on startup')
     
-    logger.info('Startup complete. model_loaded=%s index_size=%d', _model is not None, _index_impl.ntotal() if _index_impl else 0)
+    logger.info('Startup complete. model_loaded=%s index_size=%d', 
+                _model is not None, 
+                _index_impl.ntotal() if _index_impl else 0)
 
 # ------------------ 
 # Main entry point
 # ------------------ 
 if __name__ == "__main__":
     main()
-
