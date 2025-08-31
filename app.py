@@ -1,4 +1,3 @@
-# app.py
 import os
 import time
 import json
@@ -50,6 +49,11 @@ except ImportError:
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import numpy as np
+
+# Import FastAPI for creating API endpoints
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 # ------------------ 
 # CONFIG
@@ -184,6 +188,18 @@ _last_gc_run = time.time()
 _ping_thread = None
 _ping_running = False
 
+# FastAPI app for serving embeddings
+fastapi_app = FastAPI(title="Semantic Search API", version="1.0.0")
+
+# Add CORS middleware to allow requests from any origin
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ------------------ 
 # Persistence helpers
 # ------------------ 
@@ -237,7 +253,7 @@ class FaissIndex:
         if not _HAS_FAISS:
             raise RuntimeError('FAISS not available in this environment')
         
-        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
+        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_M},Flat', faiss.METRIC_INNER_PRODUCT)
         self.index = faiss.IndexIDMap(base)
         logger.info('Created new FAISS CPU index (dim=%d)', self.dim)
     
@@ -461,7 +477,7 @@ def search(q: str, topk: int = 10):
                 show_progress_bar=False
             )
             qvec = np.array(qvec)
-            qvec = _index_impl.l2_normalize_np(qvec).astype('float32')
+            qvec = _index_impl.l2_normalize_np(qvec).ast('float32')
             enc_ms = (time.time() - start) * 1000.0
     except Exception as e:
         logger.exception('Encode error: %s', e)
@@ -540,8 +556,8 @@ def embeddings_endpoint(payload):
         embeddings = []
         start_time = time.time()
         
-        for i in range(0, len(texts), settings.MAX_BATCH_SIZE):
-            batch = texts[i:i + settings.MAX_BATCH_SIZE]
+        for i in range(0, len(texts), settings.BATCH_SIZE):
+            batch = texts[i:i + settings.BATCH_SIZE]
             with _encode_semaphore:
                 vecs = model.encode(
                     batch, 
@@ -566,6 +582,38 @@ def embeddings_endpoint(payload):
         "embeddings": embeddings,
         "model": _model_meta.get('name', 'unknown'),
         "count": len(embeddings)
+    }
+
+# ------------------ 
+# FastAPI Endpoints
+# ------------------ 
+@fastapi_app.post("/embeddings")
+async def api_embeddings(payload: Dict[str, Any]):
+    """API endpoint for generating embeddings"""
+    try:
+        result = embeddings_endpoint(payload)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@fastapi_app.get("/health")
+async def api_health():
+    """Health check endpoint"""
+    return health()
+
+@fastapi_app.get("/")
+async def api_root():
+    """Root endpoint with basic info"""
+    return {
+        "message": "Semantic Search API",
+        "version": "1.0.0",
+        "endpoints": {
+            "/embeddings": "POST - Generate embeddings for text",
+            "/health": "GET - Health check",
+            "/docs": "API documentation"
+        }
     }
 
 # ------------------ 
@@ -619,10 +667,14 @@ def main():
     if 'initialized' not in st.session_state:
         startup_event()
         start_ping_thread()  # Start ping thread
+        
+        # Start FastAPI server in a separate thread
+        threading.Thread(target=run_fastapi, daemon=True).start()
+        
         st.session_state.initialized = True
     
     # Create tabs for different functionalities
-    tab1, tab2, tab3 = st.tabs(["Search", "Embeddings", "Health"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Search", "Embeddings", "Health", "API Docs"])
     
     with tab1:
         st.header("Semantic Search")
@@ -687,6 +739,65 @@ def main():
             st.info(f"Pinging {settings.PING_URL} every {settings.PING_INTERVAL} seconds")
         else:
             st.warning("PING_URL not configured - app may sleep when inactive")
+    
+    with tab4:
+        st.header("API Documentation")
+        st.markdown("""
+        ### API Endpoints
+        
+        #### POST /embeddings
+        Generate embeddings for text inputs.
+        
+        **Request Body:**
+        ```json
+        {
+          "inputs": ["text1", "text2", ...]
+        }
+        ```
+        
+        **Response:**
+        ```json
+        {
+          "embeddings": [[...], [...]],
+          "model": "model-name",
+          "count": 2
+        }
+        ```
+        
+        #### GET /health
+        Health check endpoint.
+        
+        **Response:**
+        ```json
+        {
+          "status": "ok",
+          "model_loaded": true,
+          "model_version": "model-name",
+          "index_size": 100,
+          "timestamp": 1234567890,
+          "mapping_count": 100,
+          "tombstones": 0
+        }
+        ```
+        
+        ### Usage Example
+        
+        ```python
+        import requests
+        
+        response = requests.post(
+            "https://your-app-url/embeddings",
+            json={"inputs": ["Hello world", "How are you?"]},
+            headers={"Content-Type": "application/json"}
+        )
+        
+        embeddings = response.json()["embeddings"]
+        ```
+        """)
+
+def run_fastapi():
+    """Run the FastAPI server"""
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8502, log_level="info")
 
 # ------------------ 
 # Startup and initialization
