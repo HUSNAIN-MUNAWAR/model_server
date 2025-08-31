@@ -1,4 +1,4 @@
-# semantic_search_server_ultra_fast.py
+# semantic_search_streamlit_app.py
 from __future__ import annotations
 
 import os
@@ -52,22 +52,16 @@ try:
 except ImportError:
     logger.info("ONNX Runtime not available, using standard model")
 
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-try:
-    from pydantic_settings import BaseSettings
-except ModuleNotFoundError:
-    from pydantic import BaseSettings
+# Import Streamlit
+import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 import numpy as np
 
 # ------------------ 
 # CONFIG via pydantic for clarity
 # ------------------ 
-class Settings(BaseSettings):
+class Settings:
     LOCAL_MODEL_DIR: str = 'models/all-MiniLM-L6-v2'
     MODELS_ROOT: str = 'models'
     INDEX_DIR: str = 'index'
@@ -105,9 +99,6 @@ class Settings(BaseSettings):
     USE_PROCESS_POOL: bool = False  # Use process pool for CPU-intensive tasks
     PROCESS_POOL_SIZE: int = 4  # Number of processes in pool
 
-    class Config:
-        env_file = '.env'
-
 settings = Settings()
 
 # File paths
@@ -118,40 +109,16 @@ IDS_PATH = os.path.join(INDEX_DIR, 'ids.json')
 TOMBSTONE_PATH = os.path.join(INDEX_DIR, 'tombstones.json')
 MANIFEST_PATH = os.path.join(INDEX_DIR, 'manifest.json')
 
-# FastAPI app with lifespan management
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    startup_event()
-    yield
-    # Shutdown
-    shutdown_event()
-
-app = FastAPI(
-    title='Ultra Fast Semantic Search Server',
-    docs_url='/docs',
-    redoc_url=None,  # Disable redoc for performance
-    openapi_url='/openapi.json',
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS.split(',') if settings.ALLOWED_ORIGINS else ['*'],
-    allow_credentials=True,
-    allow_methods=['GET', 'POST', 'OPTIONS'],
-    allow_headers=['*'],
-    max_age=600,  # Cache preflight requests
-)
-
 # Models
-class ProductItem(BaseModel):
-    product_id: str
-    text: str
+class ProductItem:
+    def __init__(self, product_id: str, text: str):
+        self.product_id = product_id
+        self.text = text
 
-class SearchResult(BaseModel):
-    product_id: str
-    similarity_score: float
+class SearchResult:
+    def __init__(self, product_id: str, similarity_score: float):
+        self.product_id = product_id
+        self.similarity_score = similarity_score
 
 # ------------------ 
 # Caching and optimization structures
@@ -396,7 +363,7 @@ class FaissIndex(BaseIndex):
         if settings.FAISS_ON_GPU and faiss.get_num_gpus() > 0:
             try:
                 res = faiss.StandardGpuResources()
-                base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
+                base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_M},Flat', faiss.METRIC_INNER_PRODUCT)
                 self.index = faiss.index_cpu_to_gpu(res, 0, base)
                 logger.info('Created new FAISS GPU index (dim=%d)', self.dim)
             except Exception:
@@ -725,12 +692,12 @@ def _schedule_persist():
                 _persist_scheduled = False
     
     t = threading.Thread(target=worker, daemon=True)
+    add_script_run_ctx(t)  # Make thread compatible with Streamlit
     t.start()
 
 # ------------------ 
-# API endpoints: health & search
+# API functions adapted for Streamlit
 # ------------------ 
-@app.get('/health')
 def health():
     return {
         'status': 'ok',
@@ -743,45 +710,13 @@ def health():
         'cache_stats': {'hits': _query_cache.hits, 'misses': _query_cache.misses, 'size': len(_query_cache.cache)}
     }
 
-def client_identifier(request: Request) -> str:
-    xff = request.headers.get('x-forwarded-for') or request.headers.get('X-Forwarded-For')
-    if xff:
-        return xff.split(',')[0].strip()
-    if request.client:
-        return request.client.host
-    return 'unknown'
-
-async def rate_limiter(request: Request):
-    client = client_identifier(request)
-    now = time.time()
-    with _rate_lock:
-        lst = _rate_store.get(client, [])
-        lst = [t for t in lst if t > now - settings.RATE_LIMIT_WINDOW]
-        if len(lst) >= settings.RATE_LIMIT_REQ:
-            raise HTTPException(status_code=429, detail='Too many requests')
-        lst.append(now)
-        _rate_store[client] = lst
-
-def require_api_key(
-    x_api_key: Optional[str] = Header(None, alias='x-api-key'),
-    api_key_header: Optional[str] = Header(None, alias='api_key'),
-    authorization: Optional[str] = Header(None, alias='Authorization'),
-):
-    """NO-OP authorization: always allow requests."""
-    return True
-
-@app.get('/search', response_model=List[SearchResult])
-async def search(
-    q: Optional[str] = Query(None), 
-    topk: int = Query(10, ge=1, le=100), 
-    authorized: bool = Depends(require_api_key), 
-    _rl=Depends(rate_limiter)
-):
+def search(q: str, topk: int = 10):
+    """Search function for Streamlit"""
     # Run memory optimization
     optimize_memory()
     
     if not q:
-        raise HTTPException(status_code=400, detail="Missing 'q' parameter")
+        return {"error": "Missing 'q' parameter"}
     
     # Check cache first
     cached = _query_cache.get(q, topk)
@@ -790,43 +725,34 @@ async def search(
     
     model = get_model_safe()
     if model is None and _onnx_session is None:
-        raise HTTPException(status_code=503, detail='Model not loaded; call /admin/reload_model or ensure models/ contains a valid model')
+        return {"error": 'Model not loaded; call /admin/reload_model or ensure models/ contains a valid model'}
     
     start = time.time()
     
     try:
         # Offload encode to threadpool with timeout
         with _encode_semaphore:
-            loop = asyncio.get_running_loop()
             # Truncate long queries to improve performance
             truncated_q = q[:settings.MAX_QUERY_LENGTH] if len(q) > settings.MAX_QUERY_LENGTH else q
             
             if _onnx_session is not None:
                 # Use ONNX for faster encoding
-                qvec = await asyncio.wait_for(
-                    loop.run_in_executor(_executor, encode_with_onnx, [truncated_q]),
-                    timeout=0.03  # Reduced timeout
-                )
+                qvec = encode_with_onnx([truncated_q])
             else:
                 # Use SentenceTransformer for encoding
-                qvec = await asyncio.wait_for(
-                    loop.run_in_executor(_executor, lambda: model.encode(
-                        [truncated_q], 
-                        convert_to_numpy=True, 
-                        batch_size=1,
-                        show_progress_bar=False
-                    )),
-                    timeout=0.03  # Reduced timeout
+                qvec = model.encode(
+                    [truncated_q], 
+                    convert_to_numpy=True, 
+                    batch_size=1,
+                    show_progress_bar=False
                 )
                 qvec = np.array(qvec)
             
             qvec = l2_normalize_np(qvec).astype('float32')
             enc_ms = (time.time() - start) * 1000.0
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail='Encoding timeout')
     except Exception:
         logger.exception('Encode error')
-        raise HTTPException(status_code=500, detail='Failed to encode query')
+        return {"error": 'Failed to encode query'}
     
     with _index_lock:
         # Configure FAISS for faster search if possible
@@ -867,33 +793,14 @@ async def search(
     
     return results
 
-# ------------------ 
-# Embeddings endpoint optimized for speed
-# ------------------ 
-@app.get('/embeddings')
-def embeddings_get_info():
-    """Informational GET for /embeddings - returns simple server status and explains the POST shape."""
-    return {
-        "status": "ok",
-        "note": "POST to /embeddings with JSON body {'inputs': [...]} or ['text1','text2'] or {'input': [...]} or {'text':'single'}",
-        "model_loaded": get_model_safe() is not None or _onnx_session is not None,
-        "model_meta": _model_meta,
-    }
-
-@app.post('/embeddings')
-async def embeddings_endpoint(request: Request, authorized: bool = Depends(require_api_key), _rl=Depends(rate_limiter)):
-    """Accepts multiple common payload shapes and returns embeddings."""
+def embeddings_endpoint(payload):
+    """Embeddings function for Streamlit"""
     # Run memory optimization
     optimize_memory()
     
     model = get_model_safe()
     if model is None and _onnx_session is None:
-        raise HTTPException(status_code=503, detail='Model not loaded; call /admin/reload_model or ensure models/ contains a valid model')
-    
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail='Invalid JSON body')
+        return {"error": 'Model not loaded; call /admin/reload_model or ensure models/ contains a valid model'}
     
     texts: List[str] = []
     
@@ -921,7 +828,7 @@ async def embeddings_endpoint(request: Request, authorized: bool = Depends(requi
         texts = [payload]
     
     if not texts:
-        raise HTTPException(status_code=400, detail='No valid input texts provided')
+        return {"error": 'No valid input texts provided'}
     
     # Limit batch size for performance
     if len(texts) > 100:
@@ -935,19 +842,15 @@ async def embeddings_endpoint(request: Request, authorized: bool = Depends(requi
         for i in range(0, len(texts), settings.MAX_BATCH_SIZE):
             batch = texts[i:i + settings.MAX_BATCH_SIZE]
             with _encode_semaphore:
-                loop = asyncio.get_running_loop()
                 if _onnx_session is not None:
-                    vecs = await loop.run_in_executor(_executor, encode_with_onnx, batch)
+                    vecs = encode_with_onnx(batch)
                 else:
-                    vecs = await loop.run_in_executor(
-                        _executor, 
-                        lambda: model.encode(
-                            batch, 
-                            batch_size=len(batch), 
-                            convert_to_tensor=False,  # Skip tensor conversion for speed
-                            show_progress_bar=False,
-                            normalize_embeddings=True  # Normalize directly
-                        )
+                    vecs = model.encode(
+                        batch, 
+                        batch_size=len(batch), 
+                        convert_to_tensor=False,  # Skip tensor conversion for speed
+                        show_progress_bar=False,
+                        normalize_embeddings=True  # Normalize directly
                     )
                 # Convert to python floats for JSON
                 embeddings.extend(vecs.tolist())
@@ -961,25 +864,21 @@ async def embeddings_endpoint(request: Request, authorized: bool = Depends(requi
         
     except Exception:
         logger.exception('Embedding encode failed')
-        raise HTTPException(status_code=500, detail='Failed to compute embeddings')
+        return {"error": 'Failed to compute embeddings'}
     
     # Return minimal response for speed
-    return JSONResponse(content={
+    return {
         "embeddings": embeddings,
         "model": _model_meta.get('name', 'unknown'),
         "count": len(embeddings)
-    })
+    }
 
-# ------------------ 
-# Admin endpoints optimized for speed
-# ------------------ 
-# Continue from the reindex function
-def reindex(items: List[ProductItem], authorized: bool = Depends(require_api_key)):
+def reindex(items: List[ProductItem]):
     model = get_model_safe()
     if model is None and _onnx_session is None:
-        raise HTTPException(status_code=503, detail='Model not loaded')
+        return {"error": 'Model not loaded'}
     if not items:
-        raise HTTPException(status_code=400, detail='Request body must be non-empty')
+        return {"error": 'Request body must be non-empty'}
     
     texts = [it.text for it in items]; pids = [it.product_id for it in items]
     
@@ -988,12 +887,11 @@ def reindex(items: List[ProductItem], authorized: bool = Depends(require_api_key
             if _onnx_session is not None:
                 vecs = encode_with_onnx(texts)
             else:
-                fut = _executor.submit(model.encode, texts, convert_to_numpy=True, batch_size=settings.BATCH_SIZE, show_progress_bar=False)
-                vecs = fut.result()
+                vecs = model.encode(texts, convert_to_numpy=True, batch_size=settings.BATCH_SIZE, show_progress_bar=False)
             vecs = l2_normalize_np(vecs).astype('float32')
     except Exception:
         logger.exception('Failed to encode items')
-        raise HTTPException(status_code=500, detail='Failed to encode items')
+        return {"error": 'Failed to encode items'}
     
     assigned = {}
     with _index_lock:
@@ -1015,45 +913,17 @@ def reindex(items: List[ProductItem], authorized: bool = Depends(require_api_key
     _schedule_persist()
     return {'indexed': len(assigned), 'assigned_index_ids': assigned}
 
-@app.post('/rebuild_index')
-def rebuild_index(items: List[ProductItem], authorized: bool = Depends(require_api_key)):
+def rebuild_index(items: List[ProductItem]):
     if not items:
-        raise HTTPException(status_code=400, detail='Request body must be non-empty')
+        return {"error": 'Request body must be non-empty'}
     
     # Simple rebuild implementation - just call reindex for all items
-    result = reindex(items, authorized)
+    result = reindex(items)
     return {'status': 'rebuild_complete', 'indexed': result['indexed']}
 
-@app.post('/admin/import_csv')
-def import_csv(file: UploadFile = File(...), auth=Depends(require_api_key)):
-    content = file.file.read().decode('utf-8')
-    rows = []
-    import csv, io
-    reader = csv.DictReader(io.StringIO(content))
-    for r in reader:
-        if 'product_id' not in r or 'text' not in r:
-            continue
-        rows.append(ProductItem(product_id=r['product_id'], text=r['text']))
-    
-    if not rows:
-        raise HTTPException(status_code=400, detail='No valid rows found in CSV')
-    
-    result = reindex(rows, auth)
-    return {'status': 'import_complete', 'indexed': result['indexed']}
-
-@app.post('/admin/update_item')
-def update_item(item: ProductItem, auth=Depends(require_api_key)):
-    if not item.product_id or not item.text:
-        raise HTTPException(status_code=400, detail='invalid input')
-    
-    # Reuse the reindex function for single item
-    result = reindex([item], auth)
-    return {'status': 'update_complete', 'product_id': item.product_id}
-
-@app.post('/admin/delete_items')
-def delete_items(product_ids: List[str], auth=Depends(require_api_key)):
+def delete_items(product_ids: List[str]):
     if not product_ids:
-        raise HTTPException(status_code=400, detail='Provide non-empty product_ids list')
+        return {"error": 'Provide non-empty product_ids list'}
     
     to_remove_ids = []
     with _index_lock:
@@ -1079,14 +949,13 @@ def delete_items(product_ids: List[str], auth=Depends(require_api_key)):
     _schedule_persist()
     return {'deleted': len(to_remove_ids)}
 
-@app.post('/admin/reload_model')
-def reload_model(auth=Depends(require_api_key)):
+def reload_model():
     global _model, _model_meta, _dim, _onnx_session
     model_dir = find_local_model_dir()
     if not model_dir:
-        raise HTTPException(status_code=400, detail=f'LOCAL_MODEL_DIR not found and no model in {settings.MODELS_ROOT}')
+        return {"error": f'LOCAL_MODEL_DIR not found and no model in {settings.MODELS_ROOT}'}
     if SentenceTransformer is None and not _HAS_ONNX:
-        raise HTTPException(status_code=500, detail='SentenceTransformer and ONNX not available in environment')
+        return {"error": 'SentenceTransformer and ONNX not available in environment'}
     
     try:
         # Try to load ONNX model first if enabled
@@ -1109,7 +978,7 @@ def reload_model(auth=Depends(require_api_key)):
                     new_dim = model_output.shape[-1]
                     
                     if _index_impl and _index_impl.ntotal() > 0 and new_dim != _dim:
-                        raise HTTPException(status_code=409, detail=f'model dimension mismatch (current index dim={_dim}, candidate dim={new_dim}). Rebuild required before switching.')
+                        return {"error": f'model dimension mismatch (current index dim={_dim}, candidate dim={new_dim}). Rebuild required before switching.'}
                     
                     with _model_lock:
                         old_onnx = _onnx_session
@@ -1132,7 +1001,7 @@ def reload_model(auth=Depends(require_api_key)):
         candidate = SentenceTransformer(model_dir)
         cand_dim = candidate.get_sentence_embedding_dimension()
         if _index_impl and _index_impl.ntotal() > 0 and cand_dim != _dim:
-            raise HTTPException(status_code=409, detail=f'model dimension mismatch (current index dim={_dim}, candidate dim={cand_dim}). Rebuild required before switching.')
+            return {"error": f'model dimension mismatch (current index dim={_dim}, candidate dim={cand_dim}). Rebuild required before switching.'}
         
         with _model_lock:
             old = _model
@@ -1147,31 +1016,26 @@ def reload_model(auth=Depends(require_api_key)):
                 pass
         
         return {'status': 'model_reloaded', 'model_meta': _model_meta}
-    except HTTPException:
-        raise
     except Exception:
         logger.exception('Failed to reload model')
-        raise HTTPException(status_code=500, detail='failed to load model')
+        return {"error": 'failed to load model'}
 
-@app.post('/admin/warmup')
-def warmup(auth=Depends(require_api_key)):
+def warmup():
     model = get_model_safe()
     if model is None and _onnx_session is None:
-        raise HTTPException(status_code=503, detail='Model not loaded')
+        return {"error": 'Model not loaded'}
     try:
         with _encode_semaphore:
             if _onnx_session is not None:
                 _ = encode_with_onnx(['warmup text'] * 16)
             else:
-                fut = _executor.submit(model.encode, ['warmup text'] * 16, convert_to_numpy=True, batch_size=16, show_progress_bar=False)
-                _ = fut.result()
+                _ = model.encode(['warmup text'] * 16, convert_to_numpy=True, batch_size=16, show_progress_bar=False)
     except Exception:
         logger.exception('Warmup failed')
-        raise HTTPException(status_code=500, detail='Warmup failed')
+        return {"error": 'Warmup failed'}
     return {'status': 'warmup_complete'}
 
-@app.get('/admin/metrics')
-def get_metrics(auth=Depends(require_api_key)):
+def get_metrics():
     return {
         'queries': _metrics['queries'],
         'encodes': _metrics['encodes'],
@@ -1184,10 +1048,166 @@ def get_metrics(auth=Depends(require_api_key)):
         }
     }
 
-@app.post('/admin/clear_cache')
-def clear_cache(auth=Depends(require_api_key)):
-    clear_caches()
-    return {'status': 'cache_cleared'}
+# ------------------ 
+# Streamlit UI and API endpoints
+# ------------------ 
+def main():
+    st.set_page_config(
+        page_title="Ultra Fast Semantic Search Server",
+        page_icon="🔍",
+        layout="wide"
+    )
+    
+    st.title("Ultra Fast Semantic Search Server")
+    
+    # Initialize the system
+    if 'initialized' not in st.session_state:
+        startup_event()
+        st.session_state.initialized = True
+    
+    # Create tabs for different functionalities
+    tab1, tab2, tab3, tab4 = st.tabs(["Search", "Embeddings", "Admin", "Health"])
+    
+    with tab1:
+        st.header("Semantic Search")
+        
+        # Search form
+        with st.form("search_form"):
+            query = st.text_input("Search query", placeholder="Enter your search query...")
+            topk = st.slider("Number of results", min_value=1, max_value=100, value=10)
+            submitted = st.form_submit_button("Search")
+            
+            if submitted and query:
+                with st.spinner("Searching..."):
+                    results = search(query, topk)
+                    if "error" in results:
+                        st.error(results["error"])
+                    else:
+                        st.success(f"Found {len(results)} results")
+                        for i, result in enumerate(results):
+                            st.write(f"{i+1}. {result.product_id} (Score: {result.similarity_score:.4f})")
+    
+    with tab2:
+        st.header("Embeddings Generation")
+        
+        # Embeddings form
+        with st.form("embeddings_form"):
+            input_type = st.radio("Input type", ["Text", "List of texts", "JSON"])
+            
+            if input_type == "Text":
+                text_input = st.text_area("Enter text")
+                payload = text_input
+            elif input_type == "List of texts":
+                texts_input = st.text_area("Enter texts (one per line)")
+                payload = texts_input.split("\n") if texts_input else []
+            else:  # JSON
+                json_input = st.text_area("Enter JSON payload")
+                try:
+                    payload = json.loads(json_input) if json_input else {}
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON")
+                    payload = {}
+            
+            submitted = st.form_submit_button("Generate Embeddings")
+            
+            if submitted and payload:
+                with st.spinner("Generating embeddings..."):
+                    result = embeddings_endpoint(payload)
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.success(f"Generated {result['count']} embeddings")
+                        st.json(result)
+    
+    with tab3:
+        st.header("Administration")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Model Management")
+            if st.button("Reload Model"):
+                result = reload_model()
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    st.success("Model reloaded successfully")
+                    st.json(result)
+            
+            if st.button("Warmup Model"):
+                result = warmup()
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    st.success("Model warmed up successfully")
+            
+            if st.button("Clear Cache"):
+                clear_caches()
+                st.success("Cache cleared successfully")
+        
+        with col2:
+            st.subheader("Index Management")
+            
+            # Upload CSV for indexing
+            uploaded_file = st.file_uploader("Upload CSV for indexing", type=["csv"])
+            if uploaded_file is not None:
+                import csv
+                import io
+                content = uploaded_file.read().decode('utf-8')
+                reader = csv.DictReader(io.StringIO(content))
+                items = []
+                for r in reader:
+                    if 'product_id' not in r or 'text' not in r:
+                        continue
+                    items.append(ProductItem(product_id=r['product_id'], text=r['text']))
+                
+                if items and st.button("Index CSV Data"):
+                    with st.spinner("Indexing..."):
+                        result = reindex(items)
+                        if "error" in result:
+                            st.error(result["error"])
+                        else:
+                            st.success(f"Indexed {result['indexed']} items")
+            
+            # Delete items
+            delete_ids = st.text_area("Product IDs to delete (one per line)")
+            if delete_ids and st.button("Delete Items"):
+                ids_to_delete = delete_ids.split("\n")
+                result = delete_items(ids_to_delete)
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    st.success(f"Deleted {result['deleted']} items")
+    
+    with tab4:
+        st.header("System Health")
+        
+        if st.button("Refresh Health Status"):
+            pass  # Just triggers a rerun
+        
+        health_status = health()
+        st.json(health_status)
+        
+        st.subheader("Metrics")
+        metrics = get_metrics()
+        st.json(metrics)
+        
+        # Display some charts
+        st.subheader("Performance Charts")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Total Queries", metrics['queries'])
+            st.metric("Average Query Time", f"{metrics['avg_query_ms']:.2f} ms")
+        
+        with col2:
+            st.metric("Total Encodes", metrics['encodes'])
+            st.metric("Average Encode Time", f"{metrics['avg_encode_ms']:.2f} ms")
+        
+        # Cache performance
+        cache_stats = metrics['cache_stats']
+        hit_ratio = cache_stats['hits'] / (cache_stats['hits'] + cache_stats['misses']) if (cache_stats['hits'] + cache_stats['misses']) > 0 else 0
+        st.metric("Cache Hit Ratio", f"{hit_ratio:.2%}")
 
 # ------------------ 
 # Graceful shutdown
@@ -1201,8 +1221,8 @@ def startup_event():
     manifest = load_manifest() or {}
     _next_id_counter = int(manifest.get('next_id_counter', max(_mapping.keys()) + 1 if _mapping else 0))
     
-    # Attempt to eagerly load model if available (optional)
-
+    # Attempt to eagerly load model if available
+    get_model_safe()
     
     # Ensure index exists for dim or fallback to 384 if _dim is None
     if _dim is None:
@@ -1221,34 +1241,8 @@ def startup_event():
     
     logger.info('Startup complete. model_loaded=%s index_size=%d', _model is not None or _onnx_session is not None, _index_impl.ntotal())
 
-def shutdown_event():
-    logger.info('shutdown: persisting index and mapping')
-    try:
-        with _index_lock:
-            if _index_impl:
-                try:
-                    _index_impl.persist()
-                except Exception:
-                    logger.exception('Index persist failed during shutdown')
-            if _mapping:
-                save_mapping(_mapping)
-            save_tombstones()
-            save_manifest()
-    except Exception:
-        logger.exception('Error during shutdown persist')
-    
-    # Shutdown executors
-    _executor.shutdown(wait=False)
-    if _process_executor:
-        _process_executor.shutdown(wait=False)
-
+# ------------------ 
 # Main entry point
+# ------------------ 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=9000,
-        workers=1,
-        timeout_keep_alive=30
-    )
+    main()
