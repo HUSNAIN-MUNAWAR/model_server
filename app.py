@@ -45,9 +45,9 @@ import numpy as np
 
 # Web API imports (FastAPI + uvicorn)
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, Request, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, Response
     import uvicorn
     _HAS_UVICORN = True
 except Exception:
@@ -72,8 +72,11 @@ class Settings:
     CACHE_TTL_SECONDS: int = 300
     PING_INTERVAL: int = 10
     PING_URL: str = os.environ.get("PING_URL", "")
-    # CORS / API settings
-    ALLOWED_ORIGINS: str = os.environ.get("ALLOWED_ORIGINS", "*")  # comma-separated; "*" means all
+    # CORS / API settings - Enhanced CORS configuration
+    ALLOWED_ORIGINS: str = os.environ.get("ALLOWED_ORIGINS", "*")
+    ALLOWED_METHODS: str = os.environ.get("ALLOWED_METHODS", "*")
+    ALLOWED_HEADERS: str = os.environ.get("ALLOWED_HEADERS", "*")
+    ALLOW_CREDENTIALS: bool = os.environ.get("ALLOW_CREDENTIALS", "True").lower() == "true"
     API_HOST: str = os.environ.get("MODEL_API_HOST", "0.0.0.0")
     API_PORT: int = int(os.environ.get("MODEL_API_PORT", "8000"))
 
@@ -252,7 +255,7 @@ class FaissIndex:
         if not _HAS_FAISS:
             raise RuntimeError('FAISS not available in this environment')
         
-        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
+        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_M},Flat', faiss.METRIC_INNER_PRODUCT)
         self.index = faiss.IndexIDMap(base)
         logger.info('Created new FAISS CPU index (dim=%d)', self.dim)
     
@@ -617,7 +620,7 @@ def stop_ping_thread():
     logger.info("Ping thread stopped")
 
 # ------------------ 
-# FastAPI server (embedded) - CORS enabled
+# FastAPI server (embedded) - Enhanced CORS handling
 # ------------------ 
 _api_thread = None
 _api_app: Optional[FastAPI] = None
@@ -627,22 +630,23 @@ def _create_api_app() -> Optional[FastAPI]:
         logger.warning("uvicorn/fastapi not available - API server will not start")
         return None
 
-    app = FastAPI(title="Model Server API (with CORS)")
+    app = FastAPI(title="Model Server API (with Enhanced CORS)")
 
-    # Determine allowed origins
-    allowed = settings.ALLOWED_ORIGINS.strip()
-    if allowed == "*" or allowed == "":
-        allow_origins = ["*"]
-    else:
-        allow_origins = [o.strip() for o in allowed.split(",") if o.strip()]
-
+    # Enhanced CORS middleware configuration - allow everything
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allow_origins,
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=600,
     )
+
+    # Add explicit OPTIONS handler for preflight requests
+    @app.options("/{path:path}")
+    async def universal_options_handler(path: str):
+        return Response(status_code=200)
 
     @app.get("/api/health")
     async def api_health():
@@ -657,19 +661,32 @@ def _create_api_app() -> Optional[FastAPI]:
 
     @app.post("/api/search")
     async def api_search_post(req: Request):
-        body = await req.json()
-        q = body.get("q") or body.get("query") or body.get("text")
-        topk = int(body.get("topk", 10))
-        if not q:
-            return JSONResponse(content={"error": "Missing 'q' in body"}, status_code=400)
-        res = search(q, topk)
-        return JSONResponse(content=res)
+        try:
+            body = await req.json()
+            q = body.get("q") or body.get("query") or body.get("text")
+            topk = int(body.get("topk", 10))
+            if not q:
+                return JSONResponse(content={"error": "Missing 'q' in body"}, status_code=400)
+            res = search(q, topk)
+            return JSONResponse(content=res)
+        except Exception as e:
+            logger.error(f"Error in api_search_post: {e}")
+            return JSONResponse(content={"error": "Invalid JSON payload"}, status_code=400)
 
     @app.post("/api/embeddings")
     async def api_embeddings(req: Request):
-        body = await req.json()
-        res = embeddings_endpoint(body)
-        return JSONResponse(content=res)
+        try:
+            body = await req.json()
+            res = embeddings_endpoint(body)
+            return JSONResponse(content=res)
+        except Exception as e:
+            logger.error(f"Error in api_embeddings: {e}")
+            return JSONResponse(content={"error": "Invalid JSON payload"}, status_code=400)
+
+    # Additional endpoint for direct CORS testing
+    @app.get("/api/cors-test")
+    async def cors_test():
+        return JSONResponse(content={"message": "CORS is working!", "timestamp": time.time()})
 
     return app
 
@@ -689,18 +706,25 @@ def start_api_server():
 
     def run_uvicorn():
         try:
-            # uvicorn.run will block, so run it in its own thread
-            uvicorn.run(_api_app, host=settings.API_HOST, port=settings.API_PORT, log_level="info")
+            config = uvicorn.Config(
+                _api_app, 
+                host=settings.API_HOST, 
+                port=settings.API_PORT, 
+                log_level="info",
+                timeout_keep_alive=300
+            )
+            server = uvicorn.Server(config)
+            server.run()
         except Exception as e:
             logger.exception("Failed to run uvicorn: %s", e)
 
-    _api_thread = threading.Thread(target=run_uvicorn, daemon=True)
+    _api_thread = threading.Thread(target=run_uvicorn, daemon=True, name="API-Server")
     try:
         add_script_run_ctx(_api_thread)
     except Exception:
         pass
     _api_thread.start()
-    logger.info("Started embedded FastAPI server on %s:%d (CORS enabled)", settings.API_HOST, settings.API_PORT)
+    logger.info("Started embedded FastAPI server on %s:%d (Enhanced CORS enabled)", settings.API_HOST, settings.API_PORT)
 
 # ------------------ 
 # Streamlit UI (preserving your UI)
