@@ -79,6 +79,8 @@ class Settings:
     ALLOW_CREDENTIALS: bool = os.environ.get("ALLOW_CREDENTIALS", "True").lower() == "true"
     API_HOST: str = os.environ.get("MODEL_API_HOST", "0.0.0.0")
     API_PORT: int = int(os.environ.get("MODEL_API_PORT", "8000"))
+    # New setting to control API server startup
+    ENABLE_API_SERVER: bool = os.environ.get("ENABLE_API_SERVER", "False").lower() == "true"
 
 settings = Settings()
 
@@ -255,7 +257,7 @@ class FaissIndex:
         if not _HAS_FAISS:
             raise RuntimeError('FAISS not available in this environment')
         
-        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_M},Flat', faiss.METRIC_INNER_PRODUCT)
+        base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
         self.index = faiss.IndexIDMap(base)
         logger.info('Created new FAISS CPU index (dim=%d)', self.dim)
     
@@ -700,6 +702,11 @@ def start_api_server():
         logger.info("API server already running")
         return
 
+    # Only start API server if enabled in settings
+    if not settings.ENABLE_API_SERVER:
+        logger.info("API server is disabled in settings")
+        return
+
     _api_app = _create_api_app()
     if _api_app is None:
         return
@@ -799,6 +806,17 @@ def main():
             st.info(f"Pinging {settings.PING_URL} every {settings.PING_INTERVAL} seconds")
         else:
             st.warning("PING_URL not configured - app may sleep when inactive")
+        
+        # API server status
+        st.subheader("API Server Status")
+        if settings.ENABLE_API_SERVER:
+            st.info("API Server: Enabled")
+            if _api_thread and _api_thread.is_alive():
+                st.success("API Server: Running")
+            else:
+                st.warning("API Server: Not Running")
+        else:
+            st.warning("API Server: Disabled (set ENABLE_API_SERVER=True to enable)")
 
 # ------------------ 
 # Startup
