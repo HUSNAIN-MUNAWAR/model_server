@@ -1,3 +1,4 @@
+# app.py
 import os
 import time
 import json
@@ -10,71 +11,82 @@ from pathlib import Path
 from dataclasses import dataclass
 import gc
 
-# Configure basic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('semantic_search_streamlit')
-
-# Initialize optional libraries
+# Optional accelerated libs
 SentenceTransformer = None
 faiss = None
 ort = None
 _HAS_FAISS = False
 _HAS_ONNX = False
 
-# Try to import optional/accelerated libraries
 try:
     import faiss
     _HAS_FAISS = True
-    logger.info("FAISS loaded successfully")
-except ImportError:
-    logger.warning("FAISS not available")
+    logging.getLogger().info("FAISS loaded successfully")
+except Exception:
+    logging.getLogger().warning("FAISS not available")
 
 try:
     from sentence_transformers import SentenceTransformer
-    logger.info("sentence-transformers loaded successfully")
-except ImportError:
-    logger.error("sentence-transformers not available - this is required!")
+    logging.getLogger().info("sentence-transformers loaded successfully")
+except Exception:
+    logging.getLogger().error("sentence-transformers not available - this is required!")
 
 try:
     import onnxruntime as ort
     _HAS_ONNX = True
-    logger.info("ONNX Runtime loaded successfully")
-except ImportError:
-    logger.info("ONNX Runtime not available, using standard model")
+    logging.getLogger().info("ONNX Runtime loaded successfully")
+except Exception:
+    logging.getLogger().info("ONNX Runtime not available, using standard model")
 
-# Import Streamlit
+# Streamlit UI imports
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import numpy as np
+
+# Web API imports (FastAPI + uvicorn)
+try:
+    from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
+    import uvicorn
+    _HAS_UVICORN = True
+except Exception:
+    _HAS_UVICORN = False
 
 # ------------------ 
 # CONFIG
 # ------------------ 
 class Settings:
-    # Use your existing model directory - fixed path
     LOCAL_MODEL_DIR: str = 'model/all-MiniLM-L6-v2'
     MODELS_ROOT: str = 'model'
     INDEX_DIR: str = 'index'
     HNSW_M: int = 32
     BATCH_SIZE: int = 256
     ENCODE_CONCURRENCY: int = 16
-    USE_ONNX: bool = False  # Disable ONNX for simplicity
+    USE_ONNX: bool = False
     MAX_QUERY_LENGTH: int = 128
     PRELOAD_MODEL: bool = True
     WARMUP_MODEL: bool = True
     SEARCH_CACHE_ENABLED: bool = True
     FAISS_NPROBE: int = 8
     CACHE_TTL_SECONDS: int = 300
-    # Ping settings
-    PING_INTERVAL: int = 10  # Ping every 10 seconds
-    PING_URL: str = os.environ.get("PING_URL", "")  # URL to ping
+    PING_INTERVAL: int = 10
+    PING_URL: str = os.environ.get("PING_URL", "")
+    # CORS / API settings
+    ALLOWED_ORIGINS: str = os.environ.get("ALLOWED_ORIGINS", "*")  # comma-separated; "*" means all
+    API_HOST: str = os.environ.get("MODEL_API_HOST", "0.0.0.0")
+    API_PORT: int = int(os.environ.get("MODEL_API_PORT", "8000"))
 
 settings = Settings()
 
-# File paths - using absolute paths for Streamlit Cloud compatibility
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('semantic_search_streamlit')
+
+# File paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(BASE_DIR, settings.INDEX_DIR)
 os.makedirs(INDEX_DIR, exist_ok=True)
@@ -95,8 +107,11 @@ class SearchResult:
         self.product_id = product_id
         self.similarity_score = similarity_score
 
+    def to_dict(self):
+        return {"product_id": self.product_id, "similarity_score": float(self.similarity_score)}
+
 # ------------------ 
-# Caching and optimization structures
+# Caching
 # ------------------ 
 @dataclass
 class CachedQuery:
@@ -126,6 +141,7 @@ class QueryCache:
             if key in self.cache:
                 cached = self.cache[key]
                 cached.access_count += 1
+                # move to end (simple LRU behavior)
                 del self.cache[key]
                 self.cache[key] = cached
                 self.hits += 1
@@ -176,11 +192,10 @@ _executor = ThreadPoolExecutor(
 _persist_lock = threading.Lock()
 _persist_scheduled = False
 
-# Optimization globals
 _query_cache = QueryCache(max_size=10000, ttl_seconds=settings.CACHE_TTL_SECONDS)
 _last_gc_run = time.time()
 
-# Ping thread to keep app awake
+# Ping controls
 _ping_thread = None
 _ping_running = False
 
@@ -213,7 +228,7 @@ def save_ids_atomic(ids_list: List[int]):
     atomic_write_json(IDS_PATH, ids_list)
 
 # ------------------ 
-# Index abstractions (Faiss)
+# FAISS index wrapper
 # ------------------ 
 class FaissIndex:
     def __init__(self, dim: int, path: str, hnsw_m: int = 32):
@@ -237,7 +252,6 @@ class FaissIndex:
         if not _HAS_FAISS:
             raise RuntimeError('FAISS not available in this environment')
         
-        # Fixed the typo: hnsw_M -> hnsw_m
         base = faiss.index_factory(self.dim, f'HNSW{self.hnsw_m},Flat', faiss.METRIC_INNER_PRODUCT)
         self.index = faiss.IndexIDMap(base)
         logger.info('Created new FAISS CPU index (dim=%d)', self.dim)
@@ -308,7 +322,7 @@ class FaissIndex:
         return x / norms
 
 # ------------------ 
-# Helpers: mapping/tombstones
+# mapping/tombstones
 # ------------------ 
 def load_mapping(path: str) -> Dict[int, str]:
     raw = load_json(path, {})
@@ -350,7 +364,6 @@ def _load_model_from(path: str):
     
     logger.info('Loading model from %s', path)
     
-    # Check if model directory exists
     if not os.path.exists(path):
         logger.error('Model directory does not exist: %s', path)
         return None
@@ -366,7 +379,7 @@ def _load_model_from(path: str):
     if settings.WARMUP_MODEL:
         try:
             logger.info('Warming up model...')
-            warmup_texts = ['hello world'] * 4  # Smaller batch for Streamlit
+            warmup_texts = ['hello world'] * 4
             _ = model.encode(warmup_texts, convert_to_numpy=True, batch_size=4, show_progress_bar=False)
             logger.info('Warmup complete')
         except Exception:
@@ -380,11 +393,9 @@ def get_model_safe() -> Optional[SentenceTransformer]:
         if _model is not None:
             return _model
         
-        # Use the model path from your repository
         model_dir = os.path.join(BASE_DIR, settings.LOCAL_MODEL_DIR)
         if not os.path.exists(model_dir):
             logger.error('Model not found at: %s', model_dir)
-            # Try to find any model in the models directory
             model_root = Path(os.path.join(BASE_DIR, settings.MODELS_ROOT))
             if model_root.exists() and model_root.is_dir():
                 for p in model_root.iterdir():
@@ -413,7 +424,8 @@ def ensure_index_impl(dim: int):
     global _index_impl
     with _index_lock:
         if _HAS_FAISS:
-            _index_impl = FaissIndex(dim=dim, path=FAISS_INDEX_PATH, hnsw_m=settings.HNSW_M)
+            if _index_impl is None:
+                _index_impl = FaissIndex(dim=dim, path=FAISS_INDEX_PATH, hnsw_m=settings.HNSW_M)
         else:
             raise RuntimeError("FAISS is required")
         _index_impl.load()
@@ -438,13 +450,12 @@ def search(q: str, topk: int = 10):
     
     cached = _query_cache.get(q, topk)
     if cached is not None:
-        return cached
+        return [r.to_dict() for r in cached]
     
     model = get_model_safe()
     if model is None:
         return {"error": 'Model not loaded'}
     
-    # Ensure index is initialized
     if _index_impl is None:
         if _dim is None:
             return {"error": 'Model dimension not set'}
@@ -481,7 +492,7 @@ def search(q: str, topk: int = 10):
         results: List[SearchResult] = []
         
         if I.shape[1] == 0:
-            return results
+            return []
         
         for score, idx in zip(D[0], I[0]):
             if int(idx) == -1:
@@ -500,7 +511,7 @@ def search(q: str, topk: int = 10):
     _metrics['queries'] += 1
     _metrics['avg_query_ms'] = (_metrics['avg_query_ms'] * (_metrics['queries'] - 1) + query_ms) / _metrics['queries']
     
-    return results
+    return [r.to_dict() for r in results]
 
 def embeddings_endpoint(payload):
     model = get_model_safe()
@@ -570,16 +581,9 @@ def embeddings_endpoint(payload):
     }
 
 # ------------------ 
-# FastAPI Endpoints (for external access)
-# ------------------ 
-# This section is commented out as Streamlit doesn't support running FastAPI alongside it
-# For production, consider deploying a separate FastAPI service
-
-# ------------------ 
-# Ping functionality to keep app awake
+# Ping thread
 # ------------------ 
 def start_ping_thread():
-    """Start a thread that pings the app regularly to keep it awake"""
     global _ping_thread, _ping_running
     
     if not settings.PING_URL:
@@ -598,12 +602,14 @@ def start_ping_thread():
             time.sleep(settings.PING_INTERVAL)
     
     _ping_thread = threading.Thread(target=ping_worker, daemon=True)
-    add_script_run_ctx(_ping_thread)  # Make thread compatible with Streamlit
+    try:
+        add_script_run_ctx(_ping_thread)
+    except Exception:
+        pass
     _ping_thread.start()
     logger.info("Ping thread started")
 
 def stop_ping_thread():
-    """Stop the ping thread"""
     global _ping_running
     _ping_running = False
     if _ping_thread:
@@ -611,7 +617,93 @@ def stop_ping_thread():
     logger.info("Ping thread stopped")
 
 # ------------------ 
-# Streamlit UI
+# FastAPI server (embedded) - CORS enabled
+# ------------------ 
+_api_thread = None
+_api_app: Optional[FastAPI] = None
+
+def _create_api_app() -> Optional[FastAPI]:
+    if not _HAS_UVICORN:
+        logger.warning("uvicorn/fastapi not available - API server will not start")
+        return None
+
+    app = FastAPI(title="Model Server API (with CORS)")
+
+    # Determine allowed origins
+    allowed = settings.ALLOWED_ORIGINS.strip()
+    if allowed == "*" or allowed == "":
+        allow_origins = ["*"]
+    else:
+        allow_origins = [o.strip() for o in allowed.split(",") if o.strip()]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/api/health")
+    async def api_health():
+        return JSONResponse(content=health())
+
+    @app.get("/api/search")
+    async def api_search(q: Optional[str] = None, topk: int = 10):
+        if not q:
+            return JSONResponse(content={"error": "Missing query parameter 'q'"}, status_code=400)
+        res = search(q, topk)
+        return JSONResponse(content=res)
+
+    @app.post("/api/search")
+    async def api_search_post(req: Request):
+        body = await req.json()
+        q = body.get("q") or body.get("query") or body.get("text")
+        topk = int(body.get("topk", 10))
+        if not q:
+            return JSONResponse(content={"error": "Missing 'q' in body"}, status_code=400)
+        res = search(q, topk)
+        return JSONResponse(content=res)
+
+    @app.post("/api/embeddings")
+    async def api_embeddings(req: Request):
+        body = await req.json()
+        res = embeddings_endpoint(body)
+        return JSONResponse(content=res)
+
+    return app
+
+def start_api_server():
+    global _api_thread, _api_app
+    if not _HAS_UVICORN:
+        logger.warning("Uvicorn not installed; skipping API startup")
+        return
+
+    if _api_thread and _api_thread.is_alive():
+        logger.info("API server already running")
+        return
+
+    _api_app = _create_api_app()
+    if _api_app is None:
+        return
+
+    def run_uvicorn():
+        try:
+            # uvicorn.run will block, so run it in its own thread
+            uvicorn.run(_api_app, host=settings.API_HOST, port=settings.API_PORT, log_level="info")
+        except Exception as e:
+            logger.exception("Failed to run uvicorn: %s", e)
+
+    _api_thread = threading.Thread(target=run_uvicorn, daemon=True)
+    try:
+        add_script_run_ctx(_api_thread)
+    except Exception:
+        pass
+    _api_thread.start()
+    logger.info("Started embedded FastAPI server on %s:%d (CORS enabled)", settings.API_HOST, settings.API_PORT)
+
+# ------------------ 
+# Streamlit UI (preserving your UI)
 # ------------------ 
 def main():
     st.set_page_config(
@@ -619,51 +711,45 @@ def main():
         page_icon="🔍",
         layout="wide"
     )
-    
-    st.title("Ultra Fast Semantic Search Server")
-    
-    # Initialize the system
+
+    st.title("Ultra Fast Semantic Search Server (Streamlit + API)")
+
     if 'initialized' not in st.session_state:
         startup_event()
-        start_ping_thread()  # Start ping thread
+        start_ping_thread()
+        # Start the API server (so external frontends get CORS-enabled endpoints)
+        start_api_server()
         st.session_state.initialized = True
-    
-    # Create tabs for different functionalities
+
     tab1, tab2, tab3 = st.tabs(["Search", "Embeddings", "Health"])
-    
+
     with tab1:
         st.header("Semantic Search")
-        
         with st.form("search_form"):
             query = st.text_input("Search query", placeholder="Enter your search query...")
             topk = st.slider("Number of results", min_value=1, max_value=100, value=10)
             submitted = st.form_submit_button("Search")
-            
             if submitted and query:
                 with st.spinner("Searching..."):
                     results = search(query, topk)
-                    if "error" in results:
+                    if isinstance(results, dict) and "error" in results:
                         st.error(results["error"])
                     else:
                         st.success(f"Found {len(results)} results")
                         for i, result in enumerate(results):
-                            st.write(f"{i+1}. {result.product_id} (Score: {result.similarity_score:.4f})")
-    
+                            st.write(f"{i+1}. {result['product_id']} (Score: {result['similarity_score']:.4f})")
+
     with tab2:
         st.header("Embeddings Generation")
-        
         with st.form("embeddings_form"):
             input_type = st.radio("Input type", ["Text", "List of texts"])
-            
             if input_type == "Text":
                 text_input = st.text_area("Enter text")
                 payload = text_input
             else:
                 texts_input = st.text_area("Enter texts (one per line)")
                 payload = texts_input.split("\n") if texts_input else []
-            
             submitted = st.form_submit_button("Generate Embeddings")
-            
             if submitted and payload:
                 with st.spinner("Generating embeddings..."):
                     result = embeddings_endpoint(payload)
@@ -672,23 +758,18 @@ def main():
                     else:
                         st.success(f"Generated {result['count']} embeddings")
                         st.json(result)
-    
+
     with tab3:
         st.header("System Health")
-        
         if st.button("Refresh Health Status"):
             pass
-        
         health_status = health()
         st.json(health_status)
-        
         st.subheader("Metrics")
         st.metric("Total Queries", _metrics['queries'])
         st.metric("Total Encodes", _metrics['encodes'])
         st.metric("Avg Query Time", f"{_metrics['avg_query_ms']:.2f} ms")
         st.metric("Avg Encode Time", f"{_metrics['avg_encode_ms']:.2f} ms")
-        
-        # Display ping status
         st.subheader("Ping Status")
         if settings.PING_URL:
             st.info(f"Pinging {settings.PING_URL} every {settings.PING_INTERVAL} seconds")
@@ -696,7 +777,7 @@ def main():
             st.warning("PING_URL not configured - app may sleep when inactive")
 
 # ------------------ 
-# Startup and initialization
+# Startup
 # ------------------ 
 def startup_event():
     global _mapping, _rev_map, _next_id_counter, _dim
@@ -707,16 +788,16 @@ def startup_event():
     manifest = load_manifest() or {}
     _next_id_counter = int(manifest.get('next_id_counter', max(_mapping.keys()) + 1 if _mapping else 0))
     
-    # Load model - this will use your existing model directory
     model = get_model_safe()
     
-    # Ensure index exists
     if _dim is None:
-        _dim = 384  # Default dimension for all-MiniLM-L6-v2
+        _dim = 384  # default for all-MiniLM-L6-v2
     
-    # Initialize index only if model is loaded
     if model is not None:
-        ensure_index_impl(_dim)
+        try:
+            ensure_index_impl(_dim)
+        except Exception:
+            logger.exception("Failed to initialize index")
     else:
         logger.warning("Model not loaded, index initialization skipped")
     
@@ -730,7 +811,7 @@ def startup_event():
                 _index_impl.ntotal() if _index_impl else 0)
 
 # ------------------ 
-# Main entry point
+# Entrypoint
 # ------------------ 
 if __name__ == "__main__":
     main()
