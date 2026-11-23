@@ -1,109 +1,94 @@
-                          Semantic Search Server - Overview
+# Local Semantic Search Server
 
-This is a high-performance semantic search server built with FastAPI that provides text similarity search functionality using local machine learning models.This server loads a local machine learning model (either ONNX-optimized or standard SentenceTransformer) to convert text into numerical vectors. When you add product data, it encodes the text into vectors and stores them in an efficient index (FAISS for fastest search, or NumPy as fallback). For search queries, it encodes the search text into a vector, compares it against all stored vectors using cosine similarity, and returns the closest matches with similarity scores. The system maintains consistency between stored texts and vectors, handles updates/deletions via tombstones, and persists all data to disk for reliability.The code is designed to use ONNX for faster inference if it is available and enabled (which is the default setting). If ONNX is not available or fails to load, it falls back to using the SentenceTransformer library. So, depending on your environment and configuration, it could be using either, but ONNX is preferred for performance.
+FastAPI and Streamlit reference service for embedding product text with the checked-in `all-MiniLM-L6-v2` SentenceTransformer model and ranking records by cosine similarity.
 
-Key Features
+> Status: verified local reference implementation. The included model and exact NumPy index fallback run on CPU. FAISS is optional for larger indexes. This repository does not claim production-scale latency, multi-tenant authorization, or a hosted search service.
 
-              FastAPI-based REST API with endpoints for search, embeddings, and administrative functions
-              Dual backend support: FAISS (GPU/CPU) and fallback NumPy-based index
-              ONNX Runtime integration for accelerated inference
-              Efficient caching with query and vector caching
-              Background jobs system for long-running operations
-              Automatic compaction to clean up deleted items
-              Rate limiting and basic authentication support
-              File-based persistence with atomic writes
+![Semantic search architecture](<semantic_search_diagram (1).png>)
 
-Core Components
+## What actually runs
 
-                  Model Management: Supports SentenceTransformers and ONNX models with warmup and reload capabilities
-                  Indexing System: FAISS (preferred) or an exact NumPy cosine-search fallback for local/small indexes
+- FastAPI ASGI application exported as `app:app`.
+- Local SentenceTransformer loading with warmup and model-dimension detection.
+- FAISS index when available, otherwise an exact persisted NumPy cosine-search index.
+- Bounded query length and `topk` validation.
+- `/api/reindex` and `/reindex` for local product fixtures.
+- `/api/search`, `/api/embeddings`, and `/api/health` endpoints.
+- Streamlit operator UI through `streamlit run app.py`.
+- Atomic JSON/index persistence under the ignored `index/` runtime directory.
 
-API Endpoints:
+## Architecture and data flow
 
-                /search - Main semantic search endpoint
-                /embeddings - Text embedding generation endpoint
+```mermaid
+flowchart LR
+    Input[Product records] --> Reindex[POST /reindex]
+    Reindex --> Model[all-MiniLM-L6-v2]
+    Model --> Index{FAISS if available\notherwise exact NumPy}
+    Query[GET or POST /api/search] --> Model
+    Model --> Similarity[Cosine ranking]
+    Index --> Similarity
+    Similarity --> Results[Ordered product IDs and scores]
+    Results --> UI[FastAPI / Streamlit]
+```
 
-Admin endpoints for indexing, updates, and system management
+The NumPy fallback is intentionally exact and suitable for local or small indexes. It is not presented as an HNSW or distributed-search implementation.
 
-Performance Optimizations
-                          Batch processing of queries and embeddings
-                          Thread pooling for concurrent encoding
-                          Memmapped arrays for efficient memory usage
-                          LRU caching for frequent queries
-                          Preallocated buffers to reduce memory allocation overhead
+## Quick start
 
-Step-by-Step Setup Instructions
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+uvicorn app:app --host 127.0.0.1 --port 9000
+```
 
+Open <http://127.0.0.1:9000/docs>. The health endpoint is <http://127.0.0.1:9000/api/health>.
 
-        1. Prerequisites
-                            Python 3.8 or higher installed
-                            Git installed (to clone your project if needed)
+The Streamlit UI is optional:
 
-        2. Setup Steps (Windows & Linux)
-                          
-                          Step 1: Download or create your project folder
+```powershell
+streamlit run app.py
+```
 
-                                      # If using git
-                                      git clone <your-repository-url>
-                                      cd <your-project-folder>
+## Reproducible local search
 
-   Step 2: Create and activate virtual environment
+Index three local records:
 
-      For Windows:
+```powershell
+curl.exe -X POST http://127.0.0.1:9000/reindex `
+  -H "Content-Type: application/json" `
+  -d '[{"product_id":"1","text":"wireless Bluetooth headphones with noise cancellation"},{"product_id":"2","text":"gaming mechanical keyboard with RGB lighting"},{"product_id":"3","text":"smartphone with a high-resolution camera and 5G"}]'
+```
 
-                    python -m venv venv
-                    venv\Scripts\activate
-      
-      For Linux/Mac:
+Query the persisted index:
 
-                    python3 -m venv venv
-                    source venv/bin/activate
+```powershell
+curl.exe "http://127.0.0.1:9000/api/search?q=wireless%20headphones&topk=3"
+```
 
+The reindex and search routes are intended for local fixtures. Add authentication, rate limiting, tenant isolation, and a reviewed persistence store before exposing them beyond a trusted development environment.
 
-   Step 3: Install dependencies
+## Measured local evidence
 
-                  pip install -r requirements.txt
+On 2026-11-23, the checked-in MiniLM model loaded on CPU with dimension `384`. A two-record local fixture was encoded through the NumPy fallback; the query `wireless headphones` ranked `p1` at cosine score `0.9394` above `p2` at `0.5778`. This is a smoke demonstration, not a benchmark or a quality evaluation over a representative corpus.
 
-   Step 4: Run the server
+The persisted model is `model/all-MiniLM-L6-v2`. The source records used for the smoke run were local synthetic product descriptions; no customer data was involved.
 
-    For Windows:
-                uvicorn app:app --host 0.0.0.0 --port 9000 --reload
-    For Linux:
-                uvicorn app:app --host 0.0.0.0 --port 9000 --reload
+## Validation
 
-3. Verify Installation
+```powershell
+py -3.12 -m compileall -q app.py
+py -3.12 -m pytest -q
+```
 
-        Open your browser and go to: http://localhost:9000/docs
+The tests cover deterministic NumPy-index ordering, persistence, and bounded `topk` validation. GitHub Actions repeats dependency installation, compilation, and the tests on Python 3.12.
 
-        Test the health endpoint: http://localhost:9000/health
+## Configuration and security
 
-4. Adding Some Data (Example)
+Start from [`.env.example`](.env.example). Never commit `.env` or credentials. The current tree contains no live API key, but repository history previously contained a non-empty `API_KEY`; revoke and rotate that credential with its issuing service before any deployment. History was not rewritten.
 
-Use curl or the API docs to add sample data:
+Runtime index files, manifests, tombstones, logs, caches, and local environments are intentionally ignored. The Procfile uses the real ASGI export:
 
-    curl -X POST "http://localhost:9000/reindex" -H "Content-Type: application/json" -d '[
-          {"product_id": "1", "text": "wireless Bluetooth headphones with noise cancellation"},
-          {"product_id": "2", "text": "gaming mechanical keyboard with RGB lighting"},
-          {"product_id": "3", "text": "smartphone with high-resolution camera and 5G"}
-        ]'
-5. Test Search
-
-    curl -X GET "http://localhost:9000/search?q=wireless%20headphones&topk=3"
-
-
-
-
-![alt text](<semantic_search_diagram (1).png>)
-
-## Security and runtime files
-
-Configuration is loaded from a local `.env` file. Start from
-[`.env.example`](.env.example), keep `API_KEY` empty until a local credential
-is configured, and never commit `.env`. The index manifests, tombstones,
-Python bytecode, and `server.log` are runtime outputs and are ignored.
-
-The repository history previously contained a non-empty `API_KEY` in `.env`.
-Assume that credential is exposed: revoke and rotate it with the issuing
-service before using the server, and audit any deployment that used it. This
-working-tree cleanup removes the file from the current branch but does not
-rewrite history.
+```text
+web: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 30
+```
