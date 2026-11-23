@@ -76,7 +76,7 @@ class Settings:
     ALLOWED_ORIGINS: str = os.environ.get("ALLOWED_ORIGINS", "*")
     ALLOWED_METHODS: str = os.environ.get("ALLOWED_METHODS", "*")
     ALLOWED_HEADERS: str = os.environ.get("ALLOWED_HEADERS", "*")
-    ALLOW_CREDENTIALS: bool = os.environ.get("ALLOW_CREDENTIALS", "True").lower() == "true"
+    ALLOW_CREDENTIALS: bool = os.environ.get("ALLOW_CREDENTIALS", "False").lower() == "true"
     API_HOST: str = os.environ.get("MODEL_API_HOST", "0.0.0.0")
     API_PORT: int = int(os.environ.get("MODEL_API_PORT", "8000"))
     # New setting to control API server startup
@@ -326,6 +326,72 @@ class FaissIndex:
         norms = np.where(norms == 0, 1e-12, norms)
         return x / norms
 
+
+class NumpyIndex:
+    """Small dependency-free cosine index used when FAISS is unavailable.
+
+    This is intentionally an exact-search fallback for local demos and small
+    datasets. FAISS remains the preferred implementation for larger indexes.
+    """
+
+    def __init__(self, dim: int, path: str):
+        self.dim = dim
+        self.path = os.path.splitext(path)[0] + ".npz"
+        self.index = None
+        self.vectors = np.empty((0, dim), dtype="float32")
+        self.ids = np.empty((0,), dtype="int64")
+        self.load()
+
+    def add_with_ids(self, vectors: np.ndarray, ids: np.ndarray):
+        normalized = self.l2_normalize_np(vectors).astype("float32")
+        self.vectors = np.vstack((self.vectors, normalized))
+        self.ids = np.concatenate((self.ids, ids.astype("int64")))
+        self.persist()
+
+    def remove_ids(self, ids: np.ndarray):
+        remove = set(int(value) for value in ids.tolist())
+        keep = np.array([int(value) not in remove for value in self.ids], dtype=bool)
+        self.vectors = self.vectors[keep]
+        self.ids = self.ids[keep]
+        self.persist()
+
+    def search(self, qvec: np.ndarray, topk: int):
+        if not len(self.ids):
+            return np.empty((1, 0), dtype="float32"), np.empty((1, 0), dtype="int64")
+        scores = self.vectors @ self.l2_normalize_np(qvec).reshape(-1).astype("float32")
+        order = np.argsort(-scores)[:topk]
+        return scores[order].reshape(1, -1), self.ids[order].reshape(1, -1)
+
+    def ntotal(self) -> int:
+        return int(len(self.ids))
+
+    def persist(self):
+        tmp = self.path + ".tmp.npz"
+        np.savez_compressed(tmp, vectors=self.vectors, ids=self.ids)
+        os.replace(tmp, self.path)
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            with np.load(self.path) as data:
+                vectors = np.asarray(data["vectors"], dtype="float32")
+                ids = np.asarray(data["ids"], dtype="int64")
+            if vectors.ndim != 2 or vectors.shape[1] != self.dim or len(vectors) != len(ids):
+                raise ValueError("invalid NumPy index dimensions")
+            self.vectors = vectors
+            self.ids = ids
+        except Exception:
+            logger.exception("Failed to load NumPy index; starting empty")
+
+    def l2_normalize_np(self, x: np.ndarray) -> np.ndarray:
+        if x.ndim == 1:
+            norm = np.linalg.norm(x)
+            return x / (norm + 1e-12)
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1e-12, norms)
+        return x / norms
+
 # ------------------ 
 # mapping/tombstones
 # ------------------ 
@@ -432,7 +498,9 @@ def ensure_index_impl(dim: int):
             if _index_impl is None:
                 _index_impl = FaissIndex(dim=dim, path=FAISS_INDEX_PATH, hnsw_m=settings.HNSW_M)
         else:
-            raise RuntimeError("FAISS is required")
+            if _index_impl is None:
+                logger.warning("FAISS unavailable; using exact NumPy index fallback")
+                _index_impl = NumpyIndex(dim=dim, path=FAISS_INDEX_PATH)
         _index_impl.load()
 
 # ------------------ 
@@ -449,9 +517,25 @@ def health():
         'tombstones': len(_tombstones),
     }
 
+def _normalize_topk(topk: Any) -> int:
+    try:
+        value = int(topk)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("topk must be an integer") from exc
+    if value < 1 or value > 100:
+        raise ValueError("topk must be between 1 and 100")
+    return value
+
+
 def search(q: str, topk: int = 10):
-    if not q:
+    if not isinstance(q, str) or not q.strip():
         return {"error": "Missing query parameter"}
+
+    try:
+        topk = _normalize_topk(topk)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    q = q.strip()[:settings.MAX_QUERY_LENGTH]
     
     cached = _query_cache.get(q, topk)
     if cached is not None:
@@ -470,9 +554,8 @@ def search(q: str, topk: int = 10):
     
     try:
         with _encode_semaphore:
-            truncated_q = q[:settings.MAX_QUERY_LENGTH] if len(q) > settings.MAX_QUERY_LENGTH else q
             qvec = model.encode(
-                [truncated_q], 
+                [q],
                 convert_to_numpy=True, 
                 batch_size=1,
                 show_progress_bar=False
@@ -482,7 +565,7 @@ def search(q: str, topk: int = 10):
             enc_ms = (time.time() - start) * 1000.0
     except Exception as e:
         logger.exception('Encode error: %s', e)
-        return {"error": f'Failed to encode query: {e}'}
+        return {"error": 'Failed to encode query'}
     
     with _index_lock:
         if hasattr(_index_impl.index, 'nprobe'):
@@ -585,6 +668,61 @@ def embeddings_endpoint(payload):
         "count": len(embeddings)
     }
 
+
+def reindex_items(items: Any):
+    """Encode and persist product records for the local search index."""
+    global _next_id_counter
+    if not isinstance(items, list) or not items:
+        return {"error": "Expected a non-empty list of product records"}
+    if len(items) > 10_000:
+        return {"error": "A reindex request may contain at most 10000 records"}
+
+    records: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return {"error": "Each record must be an object"}
+        product_id = str(item.get("product_id", "")).strip()
+        text = str(item.get("text", "")).strip()
+        if not product_id or not text:
+            return {"error": "Each record requires product_id and text"}
+        if product_id in seen:
+            return {"error": f"Duplicate product_id: {product_id}"}
+        seen.add(product_id)
+        records.append((product_id, text[:settings.MAX_QUERY_LENGTH]))
+
+    model = get_model_safe()
+    if model is None:
+        return {"error": "Model not loaded"}
+    if _dim is None:
+        return {"error": "Model dimension not set"}
+    ensure_index_impl(_dim)
+
+    try:
+        vectors = np.asarray(
+            model.encode(
+                [text for _, text in records],
+                convert_to_numpy=True,
+                batch_size=min(settings.BATCH_SIZE, len(records)),
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            ),
+            dtype="float32",
+        )
+        ids = np.arange(_next_id_counter, _next_id_counter + len(records), dtype="int64")
+        _index_impl.add_with_ids(vectors, ids)
+    except Exception:
+        logger.exception("Reindex failed")
+        return {"error": "Failed to encode or persist records"}
+
+    for product_id, item_id in zip((product_id for product_id, _ in records), ids):
+        _mapping[int(item_id)] = product_id
+        _rev_map[product_id] = int(item_id)
+    _next_id_counter += len(records)
+    save_mapping(_mapping)
+    save_manifest()
+    return {"count": len(records), "index_size": _index_impl.ntotal(), "model": _model_meta}
+
 # ------------------ 
 # Ping thread
 # ------------------ 
@@ -634,14 +772,16 @@ def _create_api_app() -> Optional[FastAPI]:
 
     app = FastAPI(title="Model Server API (with Enhanced CORS)")
 
-    # Enhanced CORS middleware configuration - allow everything
+    configured_origins = [value.strip() for value in settings.ALLOWED_ORIGINS.split(",") if value.strip()]
+    allow_origins = configured_origins or ["*"]
+    allow_credentials = settings.ALLOW_CREDENTIALS and allow_origins != ["*"]
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
+        allow_origins=allow_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=[value.strip() for value in settings.ALLOWED_METHODS.split(",") if value.strip()] or ["*"] ,
+        allow_headers=[value.strip() for value in settings.ALLOWED_HEADERS.split(",") if value.strip()] or ["*"] ,
         max_age=600,
     )
 
@@ -685,12 +825,29 @@ def _create_api_app() -> Optional[FastAPI]:
             logger.error(f"Error in api_embeddings: {e}")
             return JSONResponse(content={"error": "Invalid JSON payload"}, status_code=400)
 
+    @app.post("/api/reindex")
+    @app.post("/reindex")
+    async def api_reindex(req: Request):
+        try:
+            body = await req.json()
+            items = body.get("items") if isinstance(body, dict) and "items" in body else body
+            result = reindex_items(items)
+            status = 400 if "error" in result else 200
+            return JSONResponse(content=result, status_code=status)
+        except Exception:
+            logger.exception("Error in reindex request")
+            return JSONResponse(content={"error": "Invalid reindex payload"}, status_code=400)
+
     # Additional endpoint for direct CORS testing
     @app.get("/api/cors-test")
     async def cors_test():
         return JSONResponse(content={"message": "CORS is working!", "timestamp": time.time()})
 
     return app
+
+
+# Export the ASGI application used by the Procfile and local uvicorn runs.
+app = _create_api_app()
 
 def start_api_server():
     global _api_thread, _api_app
