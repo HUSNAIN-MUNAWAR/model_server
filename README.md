@@ -16,7 +16,7 @@ Key Features
 Core Components
 
                   Model Management: Supports SentenceTransformers and ONNX models with warmup and reload capabilities
-                  Indexing System: FAISS (preferred) or NumPy-based vector storage with HNSW for approximate nearest neighbors
+                  Indexing System: FAISS (preferred) or an exact NumPy cosine-search fallback for local/small indexes
 
 API Endpoints:
 
@@ -67,9 +67,9 @@ Step-by-Step Setup Instructions
    Step 4: Run the server
 
     For Windows:
-                uvicorn semantic_search_server_ultra_optimized:app --host 0.0.0.0 --port 9000 --reload
+                uvicorn app:app --host 0.0.0.0 --port 9000 --reload
     For Linux:
-                uvicorn semantic_search_server_ultra_optimized:app --host 0.0.0.0 --port 9000 --reload
+                uvicorn app:app --host 0.0.0.0 --port 9000 --reload
 
 3. Verify Installation
 
@@ -81,7 +81,7 @@ Step-by-Step Setup Instructions
 
 Use curl or the API docs to add sample data:
 
-        curl -X POST "http://localhost:9000/reindex" -H "Content-Type: application/json" -d '[
+    curl -X POST "http://localhost:9000/reindex" -H "Content-Type: application/json" -d '[
           {"product_id": "1", "text": "wireless Bluetooth headphones with noise cancellation"},
           {"product_id": "2", "text": "gaming mechanical keyboard with RGB lighting"},
           {"product_id": "3", "text": "smartphone with high-resolution camera and 5G"}
