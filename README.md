@@ -94,3 +94,16 @@ Use curl or the API docs to add sample data:
 
 
 ![alt text](<semantic_search_diagram (1).png>)
+
+## Security and runtime files
+
+Configuration is loaded from a local `.env` file. Start from
+[`.env.example`](.env.example), keep `API_KEY` empty until a local credential
+is configured, and never commit `.env`. The index manifests, tombstones,
+Python bytecode, and `server.log` are runtime outputs and are ignored.
+
+The repository history previously contained a non-empty `API_KEY` in `.env`.
+Assume that credential is exposed: revoke and rotate it with the issuing
+service before using the server, and audit any deployment that used it. This
+working-tree cleanup removes the file from the current branch but does not
+rewrite history.

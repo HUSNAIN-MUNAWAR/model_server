@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+server.log
+__pycache__/
+*.py[cod]
+index/manifest.json
+index/tombstones.json
