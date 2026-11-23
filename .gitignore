@@ -3,6 +3,7 @@
 !.env.example
 server.log
 __pycache__/
+.mypy_cache/
 *.py[cod]
 index/manifest.json
 index/tombstones.json
